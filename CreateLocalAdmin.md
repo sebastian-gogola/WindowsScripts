@@ -1,6 +1,6 @@
 # Create-LocalAdmin.ps1
 
-A production-ready PowerShell script for creating a local administrator account on Windows 10/11 endpoints, designed for deployment via MDM platforms (Microsoft Intune, VMware Workspace ONE, Kandji, Mosyle, etc.) that support pushing custom PowerShell scripts but lack native CSP support for local user management.
+A production-ready PowerShell script for creating a local administrator account on Windows 10/11 endpoints, designed for deployment via MDM platforms (Iru) that support pushing custom PowerShell scripts but lack native CSP support for local user management.
 
 ---
 
