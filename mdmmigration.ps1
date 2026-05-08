@@ -54,7 +54,8 @@ param(
     [string]$TenantLocation,
     [string[]]$UninstallApp,
     [switch]$Debug,
-    [switch]$Silent
+    [switch]$Silent,
+    [switch]$ForceRemigration
 )
 
 # ---------------------------------------------------------------------------------
@@ -71,6 +72,7 @@ $TenantLocationDefault   = $null  # Example: "US" or "EU"
 $UninstallAppDefault     = @()    # Example: @("msiexec /x {GUID} /qn /norestart", '"C:\Program Files\agent\Uninstall Agent.exe" /allusers /S')
 $EnableDebugDefault      = $false
 $EnableSilentDefault     = $true
+$ForceRemigrationDefault = $false  # Set true to always unenroll/re-enroll even when ProviderID already looks like Kandji/Iru (same as -ForceRemigration)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -140,8 +142,6 @@ function Initialize-Logger {
 $interopSource = @"
 using System;
 using System.Runtime.InteropServices;
-using System.Runtime.ExceptionServices;
-using System.Security;
 using System.Threading;
 
 namespace Interop {
@@ -429,8 +429,6 @@ namespace Interop {
             return threadResult;
         }
 
-        [HandleProcessCorruptedStateExceptions]
-        [SecurityCritical]
         private static int InvokeUnregisterSafe(string enrollmentId, out uint exceptionCode) {
             exceptionCode = 0;
             Log(string.Format("[InvokeUnregisterSafe] Starting unregister for enrollment ID: {0}", enrollmentId));
@@ -1321,6 +1319,15 @@ function Invoke-ApplicationUninstalls {
     Log-Info ("Application uninstall process complete: {0} succeeded, {1} failed out of {2} total command(s)." -f $successCount, $failureCount, $validCommands.Count)
 }
 
+function Test-IsKandjiOrIruProviderId {
+    param([string]$ProviderId)
+    if ([string]::IsNullOrWhiteSpace($ProviderId)) {
+        return $false
+    }
+    $p = $ProviderId.ToLowerInvariant()
+    return $p.Contains('kandji') -or $p.Contains('iru')
+}
+
 function Get-EnrollmentCandidates {
     $list = @()
     $root = $null
@@ -1718,7 +1725,8 @@ if ($PSBoundParameters.ContainsKey('UninstallApp') -and $null -ne $UninstallApp)
 
 $script:DebugMode = $Debug.IsPresent -or $EnableDebugDefault
 $silentMode = $Silent.IsPresent -or $EnableSilentDefault
-    
+$forceRemigration = $ForceRemigration.IsPresent -or $ForceRemigrationDefault
+
 if (-not (Test-TenantParams -TenantName $tenantName -BlueprintId $blueprintId -EnrollmentCode $enrollmentCode -TenantId $tenantId -TenantLocation $tenantLocation)) {
     Log-Error "Script exit code: 1"
     exit 1
@@ -1833,6 +1841,26 @@ if (-not (Test-IsElevated)) {
     exit 1
 }
 
+$candidateArray = @(Get-EnrollmentCandidates)
+if (-not $forceRemigration -and $candidateArray.Count -gt 0) {
+    $allKandjiOrIru = $true
+    foreach ($c in $candidateArray) {
+        if (-not (Test-IsKandjiOrIruProviderId -ProviderId $c.ProviderId)) {
+            $allKandjiOrIru = $false
+            break
+        }
+    }
+    if ($allKandjiOrIru) {
+        Log-Info "Device is already enrolled to Kandji/Iru (every enrollment ProviderID contains 'kandji' or 'iru'). Skipping unenroll and re-enrollment."
+        foreach ($enr in $candidateArray) {
+            Log-Info ("  Enrollment ID={0}, ProviderID='{1}'" -f $enr.Id, $enr.ProviderId)
+        }
+        Log-Info "Use -ForceRemigration to unenroll and re-enroll regardless of provider."
+        Log-Info "Script exit code: 0 (already on target stack)"
+        exit 0
+    }
+}
+
 if (-not (Initialize-MdmRegistration)) {
     exit 1
 }
@@ -1851,11 +1879,6 @@ try {
     $enrollParams.ManagementUrl = $managementUrl
     Log-Info ("Using management URL for registration: {0}" -f $managementUrl)
 
-    $candidates = Get-EnrollmentCandidates
-    $candidateArray = @()
-    if ($null -ne $candidates) {
-        $candidateArray = @($candidates)
-    }
     $candidateCount = $candidateArray.Count
 
     if ($candidateCount -eq 0) {
