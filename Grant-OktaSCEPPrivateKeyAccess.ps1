@@ -30,7 +30,7 @@
 [CmdletBinding()]
 param(
     [string[]]$SearchHints = @(
-        'ZOHZBKOQTBOQ',
+        'YOUR_OKTA_TENANT_IDENTIFIER',
         'Okta',
         'SCEP'
     ),
