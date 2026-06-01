@@ -1,3 +1,32 @@
+<#
+.SYNOPSIS
+    Grants the logged-in user read access to the Okta SCEP certificate private key
+    in the Local Machine store.
+
+.DESCRIPTION
+    This script identifies the Okta/SCEP certificate deployed via Iru's SCEP Library
+    Item and grants the currently logged-in user GENERIC_READ access to its private
+    key. This is a workaround for the certificate being installed to the Local Computer
+    store instead of the Current User store.
+
+.NOTES
+    Author:  Sebastian Gogola
+    Version: 1.0
+
+    Legal Disclaimer
+    This script is provided "as is" without any warranties or guarantees of any kind,
+    either expressed or implied. By using this script, you acknowledge and agree that
+    you do so entirely at your own risk and discretion.
+
+    Iru shall not be held responsible or liable for any damages, losses, security
+    issues, data loss, system failures, legal consequences, or any other outcomes
+    resulting from the use, misuse, or inability to use this script.
+
+    It is the user's sole responsibility to review, test, and ensure the script is
+    suitable, secure, and compliant with their intended environment and applicable
+    laws before use.
+#>
+
 [CmdletBinding()]
 param(
     [string[]]$SearchHints = @(
