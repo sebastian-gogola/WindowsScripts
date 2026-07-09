@@ -192,7 +192,7 @@ For CNG-backed keys, the script uses the NCrypt API (via P/Invoke) to read the e
 ### Deployment via Iru
 The script should be deployed as a Custom Script in Iru, assigned to the same Blueprint as the SCEP profile. Ensure it runs with SYSTEM-level privileges. It can also be run manually on individual devices for troubleshooting.
 
-- [https://github.com/sebastian-gogola/WindowsScripts/blob/main/Experimental/Grant-OktaSCEPPrivateKeyAccess.ps1](https://github.com/sebastian-gogola/WindowsScripts/blob/main/Experimental/Grant-OktaSCEPPrivateKeyAccess.ps1)
+- [Grant-OktaSCEPPrivateKeyAccess.ps1](Grant-OktaSCEPPrivateKeyAccess.ps1)
 
 > [!IMPORTANT]
 > This script modifies security ACLs on cryptographic key material. Always test with the -WhatIf switch first. Review the output carefully before running in production.
