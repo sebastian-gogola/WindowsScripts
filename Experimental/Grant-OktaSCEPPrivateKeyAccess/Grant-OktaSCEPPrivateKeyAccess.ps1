@@ -1,17 +1,76 @@
 <#
 .SYNOPSIS
-    Grants the logged-in user read access to the Okta SCEP certificate private key
+    Grants the logged-on user read access to the Okta SCEP certificate private key
     in the Local Machine store.
 
 .DESCRIPTION
-    This script identifies the Okta/SCEP certificate deployed via Iru's SCEP Library
-    Item and grants the currently logged-in user GENERIC_READ access to its private
-    key. This is a workaround for the certificate being installed to the Local Computer
+    Identifies the Okta/SCEP certificate deployed via Iru's SCEP Library Item and
+    grants the currently logged-on user GENERIC_READ access to its private key.
+    This is a workaround for the certificate being installed to the Local Computer
     store instead of the Current User store.
+
+    Certificate selection, in order of precedence:
+
+      1. -Thumbprint  : exact match, no heuristics. Fully deterministic, but note
+                        that SCEP renewal reissues the certificate and changes the
+                        thumbprint, so a pinned thumbprint will stop matching after
+                        renewal.
+      2. -IssuerMatch : regex hard-filter on the Issuer DN, applied before scoring.
+                        Survives renewal; recommended for production deployments.
+      3. SearchHints  : scored heuristic across Subject / Issuer / FriendlyName /
+                        DNS SANs. At least one hint must match (see -MinimumScore)
+                        so the script fails closed instead of ACLing an unrelated
+                        client-auth key (e.g. an MDM enrollment or EAP-TLS cert).
+
+.PARAMETER Thumbprint
+    Exact SHA-1 thumbprint of the target certificate in Cert:\LocalMachine\My.
+    Bypasses all heuristics. Whitespace is ignored.
+
+.PARAMETER SearchHints
+    Substrings matched case-insensitively against the certificate's Subject,
+    Issuer, FriendlyName and DNS SANs. Each matching hint adds 40 points.
+    Replace or extend the defaults with a tenant-specific value (e.g. your Okta
+    org identifier) before deploying.
+
+.PARAMETER IssuerMatch
+    Optional regex applied to the Issuer DN as a hard filter before scoring.
+
+.PARAMETER MinimumScore
+    Minimum score required to act on a certificate. Default 40, which requires at
+    least one SearchHints match. The Client Authentication EKU contributes 30
+    points and is deliberately insufficient on its own.
+
+.EXAMPLE
+    .\Grant-OktaSCEPPrivateKeyAccess.ps1 -WhatIf
+
+.EXAMPLE
+    .\Grant-OktaSCEPPrivateKeyAccess.ps1 -IssuerMatch 'Okta'
+
+.EXAMPLE
+    .\Grant-OktaSCEPPrivateKeyAccess.ps1 -Thumbprint 0123456789ABCDEF0123456789ABCDEF01234567
 
 .NOTES
     Author:  Sebastian Gogola
-    Version: 1.0
+    Version: 2.0
+
+    Version 2.0 changes:
+      - Selection fails closed: the baseline points previously awarded for
+        validity and private-key presence are gone (every candidate had them, so
+        any client-auth certificate could clear the old threshold with zero hint
+        matches and the script could ACL the wrong private key).
+      - Ambiguity guard: distinct certificates tying on score abort with guidance;
+        same-subject ties (renewal overlap) resolve to the newest NotAfter.
+      - Added -Thumbprint and -IssuerMatch for deterministic targeting.
+      - Fixed the NCrypt key handle lifetime (DangerousAddRef/DangerousRelease
+        around the P/Invoke; the previous inline DangerousGetHandle() left the
+        duplicated SafeHandle unrooted and collectible mid-call).
+      - DACL enumeration no longer assumes every ACE is a CommonAce.
+      - File ACLs are granted and checked by SID instead of account name
+        (NTAccount translation of Entra "AzureAD\UPN" identities is unreliable).
+      - File ACL presence check requires the full Read mask, not any read bit.
+      - Real -WhatIf/-Confirm support via SupportsShouldProcess.
+      - Add-Type guarded for repeated in-session runs; formerly silent catch
+        blocks now emit -Verbose diagnostics.
 
     Legal Disclaimer
     This script is provided "as is" without any warranties or guarantees of any kind,
@@ -27,18 +86,29 @@
     laws before use.
 #>
 
-[CmdletBinding()]
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Heuristic')]
 param(
+    [Parameter(ParameterSetName = 'Thumbprint', Mandatory = $true)]
+    [string]$Thumbprint,
+
+    [Parameter(ParameterSetName = 'Heuristic')]
     [string[]]$SearchHints = @(
-        'YOUR_OKTA_TENANT_IDENTIFIER',
         'Okta',
         'SCEP'
     ),
-    [int]$MinimumScore = 50,
-    [switch]$WhatIf
+
+    [Parameter(ParameterSetName = 'Heuristic')]
+    [string]$IssuerMatch,
+
+    [Parameter(ParameterSetName = 'Heuristic')]
+    [int]$MinimumScore = 40
 )
 
-Add-Type -Language CSharp @"
+if (-not ('CngKeyAclHelper' -as [type])) {
+    Add-Type -Language CSharp @"
 using System;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -137,8 +207,9 @@ public static class CngKeyAclHelper
         }
 
         bool found = false;
-        foreach (CommonAce ace in csd.DiscretionaryAcl)
+        foreach (GenericAce genericAce in csd.DiscretionaryAcl)
         {
+            CommonAce ace = genericAce as CommonAce;
             if (ace == null)
             {
                 continue;
@@ -215,8 +286,16 @@ public static class CngKeyAclHelper
     }
 }
 "@
+}
 
 function Get-LoggedOnUser {
+    [CmdletBinding()]
+    param()
+
+    # Console user first; explorer.exe owner as fallback covers cases where
+    # Win32_ComputerSystem.UserName is empty (e.g. RDP sessions). If multiple
+    # interactive sessions exist, the first explorer process wins - acceptable
+    # for single-user endpoints, revisit for multi-session hosts.
     $csUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
     if ($csUser) {
         try {
@@ -227,6 +306,7 @@ function Get-LoggedOnUser {
             }
         }
         catch {
+            Write-Verbose "NTAccount translation failed for '$csUser': $($_.Exception.Message). Falling back to explorer.exe owner."
         }
     }
 
@@ -274,6 +354,7 @@ function Test-ClientAuthenticationEku {
                 }
             }
             catch {
+                Write-Verbose "Failed to decode EKU extension on $($Cert.Thumbprint): $($_.Exception.Message)"
             }
         }
     }
@@ -298,6 +379,7 @@ function Get-CertificateTextBlob {
         if ($dnsNames) { $parts += $dnsNames }
     }
     catch {
+        Write-Verbose "Failed to read DNS SANs on $($Cert.Thumbprint): $($_.Exception.Message)"
     }
 
     return ($parts -join ' ')
@@ -310,27 +392,56 @@ function Get-CertificateScore {
         [string[]]$Hints
     )
 
+    # Deliberately no points for validity or private-key presence: every candidate
+    # is pre-filtered on those, so they carry no signal. EKU alone (30) must stay
+    # below the default threshold (40) so an unrelated client-auth certificate
+    # can never be selected without at least one hint match.
     $score = 0
-    $now = Get-Date
 
-    if ($Cert.HasPrivateKey) { $score += 20 }
-    if ($Cert.NotBefore -lt $now -and $Cert.NotAfter -gt $now) { $score += 20 }
     if (Test-ClientAuthenticationEku -Cert $Cert) { $score += 30 }
 
     $blob = Get-CertificateTextBlob -Cert $Cert
 
     foreach ($hint in $Hints) {
         if ([string]::IsNullOrWhiteSpace($hint)) { continue }
-        if ($blob -match [regex]::Escape($hint)) { $score += 25 }
+        if ($blob -match [regex]::Escape($hint)) { $score += 40 }
     }
 
     return $score
 }
 
+function Get-CertificateByThumbprint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Thumbprint
+    )
+
+    $normalized = ($Thumbprint -replace '\s', '').ToUpper()
+    if ($normalized -notmatch '^[0-9A-F]{40}$') {
+        throw "Thumbprint '$Thumbprint' is not a valid SHA-1 thumbprint (expected 40 hex characters)."
+    }
+
+    $cert = Get-ChildItem "Cert:\LocalMachine\My\$normalized" -ErrorAction SilentlyContinue
+    if (-not $cert) {
+        throw "No certificate with thumbprint $normalized was found in Cert:\LocalMachine\My."
+    }
+    if (-not $cert.HasPrivateKey) {
+        throw "Certificate $normalized does not have an associated private key."
+    }
+
+    $now = Get-Date
+    if ($cert.NotAfter -le $now -or $cert.NotBefore -ge $now) {
+        Write-Warning "Certificate $normalized is not currently time-valid (NotBefore=$($cert.NotBefore), NotAfter=$($cert.NotAfter)). Proceeding because the thumbprint was explicitly specified."
+    }
+
+    return $cert
+}
+
 function Find-BestOktaLikeCertificate {
     param(
         [string[]]$Hints,
-        [int]$MinimumScore = 50
+        [string]$IssuerMatch,
+        [int]$MinimumScore = 40
     )
 
     $now = Get-Date
@@ -345,28 +456,42 @@ function Find-BestOktaLikeCertificate {
         throw "No valid certificates with private keys were found in Cert:\LocalMachine\My."
     }
 
-    $ranked = foreach ($cert in $certs) {
+    if (-not [string]::IsNullOrWhiteSpace($IssuerMatch)) {
+        $certs = @($certs | Where-Object { $_.Issuer -match $IssuerMatch })
+        if (-not $certs) {
+            throw "No valid certificate with a private key matched -IssuerMatch '$IssuerMatch' in Cert:\LocalMachine\My."
+        }
+    }
+
+    $ranked = @(foreach ($cert in $certs) {
         [PSCustomObject]@{
             Cert  = $cert
             Score = Get-CertificateScore -Cert $cert -Hints $Hints
         }
-    }
+    })
 
-    $ranked = $ranked | Sort-Object @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Cert.NotAfter }; Descending = $true }
+    $ranked = @($ranked | Sort-Object @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Cert.NotAfter }; Descending = $true })
 
     Write-Host "Top certificate candidates:"
     $ranked | Select-Object -First 5 | ForEach-Object {
-        Write-Host ("  Score={0} | Subject={1} | Thumbprint={2}" -f $_.Score, $_.Cert.Subject, $_.Cert.Thumbprint)
+        Write-Host ("  Score={0} | Subject={1} | Issuer={2} | Thumbprint={3}" -f $_.Score, $_.Cert.Subject, $_.Cert.Issuer, $_.Cert.Thumbprint)
     }
 
-    $best = $ranked | Select-Object -First 1
-
-    if (-not $best) {
-        throw "Unable to identify a candidate certificate."
-    }
+    $best = $ranked[0]
 
     if ($best.Score -lt $MinimumScore) {
-        throw "Could not confidently identify the Okta/SCEP certificate. Best score was $($best.Score), below threshold $MinimumScore."
+        throw "Could not confidently identify the Okta/SCEP certificate. Best score was $($best.Score), below threshold $MinimumScore. Add a tenant-specific value to -SearchHints, or target the certificate with -IssuerMatch or -Thumbprint."
+    }
+
+    if ($ranked.Count -gt 1 -and $ranked[1].Score -eq $best.Score) {
+        if ($ranked[1].Cert.Subject -eq $best.Cert.Subject) {
+            # Same subject at the same score is the renewal-overlap case; the sort
+            # already put the newest NotAfter first, so proceed with it.
+            Write-Verbose "Multiple certificates with subject '$($best.Cert.Subject)' tied at score $($best.Score); selecting the one with the latest NotAfter ($($best.Cert.NotAfter))."
+        }
+        else {
+            throw "Ambiguous match: '$($best.Cert.Subject)' ($($best.Cert.Thumbprint)) and '$($ranked[1].Cert.Subject)' ($($ranked[1].Cert.Thumbprint)) both scored $($best.Score). Refusing to guess. Re-run with -IssuerMatch or -Thumbprint."
+        }
     }
 
     return $best.Cert
@@ -392,6 +517,7 @@ function Get-CngKeyContextFromCert {
         }
     }
     catch {
+        Write-Verbose "RSA private key probe failed for $($Cert.Thumbprint): $($_.Exception.Message)"
     }
 
     try {
@@ -408,6 +534,7 @@ function Get-CngKeyContextFromCert {
         }
     }
     catch {
+        Write-Verbose "ECDSA private key probe failed for $($Cert.Thumbprint): $($_.Exception.Message)"
     }
 
     return $null
@@ -434,6 +561,7 @@ function Get-PrivateKeyFilePath {
         }
     }
     catch {
+        Write-Verbose "CspKeyContainerInfo probe failed: $($_.Exception.Message)"
     }
 
     try {
@@ -459,6 +587,7 @@ function Get-PrivateKeyFilePath {
         }
     }
     catch {
+        Write-Verbose "certutil key container probe failed: $($_.Exception.Message)"
     }
 
     $uniquePaths = $pathsToTry | Where-Object { $_ } | Select-Object -Unique
@@ -473,6 +602,7 @@ function Get-PrivateKeyFilePath {
 }
 
 function Grant-FileBackedPrivateKeyRead {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$KeyPath,
@@ -480,40 +610,52 @@ function Grant-FileBackedPrivateKeyRead {
         [Parameter(Mandatory = $true)]
         [string]$Identity,
 
-        [switch]$WhatIf
+        [Parameter(Mandatory = $true)]
+        [string]$IdentitySid
     )
+
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($IdentitySid)
+    $readMask = [System.Security.AccessControl.FileSystemRights]::Read
 
     $acl = Get-Acl -Path $KeyPath -ErrorAction Stop
 
     $existingRule = $acl.Access | Where-Object {
-        $_.IdentityReference -eq $Identity -and
-        $_.AccessControlType -eq 'Allow' -and
-        (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0)
+        $ruleSid = $null
+        try {
+            $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        catch {
+            Write-Verbose "Could not translate ACL identity '$($_.IdentityReference)' to a SID."
+        }
+
+        ($ruleSid -eq $IdentitySid) -and
+        ($_.AccessControlType -eq 'Allow') -and
+        (($_.FileSystemRights -band $readMask) -eq $readMask)
     } | Select-Object -First 1
 
     if ($existingRule) {
-        Write-Host "Read permission already exists for '$Identity'."
+        Write-Host "Read permission already exists for '$Identity' ($IdentitySid)."
+        return
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($KeyPath, "Grant Read access to '$Identity' ($IdentitySid)")) {
         return
     }
 
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $Identity,
-        [System.Security.AccessControl.FileSystemRights]::Read,
+        $sid,
+        $readMask,
         [System.Security.AccessControl.AccessControlType]::Allow
     )
 
     $acl.AddAccessRule($rule) | Out-Null
 
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would grant Read access to '$Identity' on '$KeyPath'"
-        return
-    }
-
     Set-Acl -Path $KeyPath -AclObject $acl -ErrorAction Stop
-    Write-Host "Granted Read access to '$Identity' on '$KeyPath'"
+    Write-Host "Granted Read access to '$Identity' ($IdentitySid) on '$KeyPath'"
 }
 
 function Grant-CngPrivateKeyRead {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         $CngContext,
@@ -522,23 +664,33 @@ function Grant-CngPrivateKeyRead {
         [string]$Identity,
 
         [Parameter(Mandatory = $true)]
-        [string]$IdentitySid,
-
-        [switch]$WhatIf
+        [string]$IdentitySid
     )
 
     if (-not [CngKeyAclHelper]::ProviderSupportsSecurityDescriptors($CngContext.ProviderName)) {
-        throw "The provider '$($CngContext.ProviderName)' does not report support for key security descriptors."
+        throw "The provider '$($CngContext.ProviderName)' does not report support for key security descriptors, so the key ACL cannot be modified through NCrypt."
     }
 
-    $handle = $CngContext.Key.Handle.DangerousGetHandle()
-
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would grant GENERIC_READ on CNG key '$($CngContext.UniqueName)' to '$Identity' ($IdentitySid)"
+    if (-not $PSCmdlet.ShouldProcess("CNG key '$($CngContext.UniqueName)'", "Grant GENERIC_READ to '$Identity' ($IdentitySid)")) {
         return
     }
 
-    [CngKeyAclHelper]::GrantRead($handle, $IdentitySid)
+    # CngKey.Handle returns a new duplicated SafeNCryptKeyHandle on each access.
+    # Hold it in a variable and pin it with DangerousAddRef/DangerousRelease so
+    # the native handle cannot be released by the GC while NCrypt is using it.
+    $safeHandle = $CngContext.Key.Handle
+    $addRefSucceeded = $false
+    try {
+        $safeHandle.DangerousAddRef([ref]$addRefSucceeded)
+        [CngKeyAclHelper]::GrantRead($safeHandle.DangerousGetHandle(), $IdentitySid)
+    }
+    finally {
+        if ($addRefSucceeded) {
+            $safeHandle.DangerousRelease()
+        }
+        $safeHandle.Dispose()
+    }
+
     Write-Host "Granted CNG key read access to '$Identity' ($IdentitySid) on '$($CngContext.UniqueName)'"
 }
 
@@ -552,11 +704,19 @@ try {
     Write-Host "Logged-on SID:  $identitySid"
     Write-Host ""
 
-    Write-Host "Searching for best matching Okta/SCEP certificate..."
-    $cert = Find-BestOktaLikeCertificate -Hints $SearchHints -MinimumScore $MinimumScore
+    if ($PSCmdlet.ParameterSetName -eq 'Thumbprint') {
+        Write-Host "Looking up certificate by thumbprint..."
+        $cert = Get-CertificateByThumbprint -Thumbprint $Thumbprint
+        $selectionMethod = "explicit thumbprint"
+    }
+    else {
+        Write-Host "Searching for best matching Okta/SCEP certificate..."
+        $cert = Find-BestOktaLikeCertificate -Hints $SearchHints -IssuerMatch $IssuerMatch -MinimumScore $MinimumScore
+        $selectionMethod = "heuristic (threshold $MinimumScore)"
+    }
 
     Write-Host ""
-    Write-Host "Selected certificate:"
+    Write-Host "Selected certificate ($selectionMethod):"
     Write-Host "  Subject:       $($cert.Subject)"
     Write-Host "  Issuer:        $($cert.Issuer)"
     Write-Host "  Thumbprint:    $($cert.Thumbprint)"
@@ -576,7 +736,7 @@ try {
         Write-Host ""
 
         Write-Host "Applying CNG key ACL change..."
-        Grant-CngPrivateKeyRead -CngContext $cng -Identity $identity -IdentitySid $identitySid -WhatIf:$WhatIf
+        Grant-CngPrivateKeyRead -CngContext $cng -Identity $identity -IdentitySid $identitySid
     }
     else {
         Write-Host "Detected file-backed / legacy key."
@@ -586,11 +746,12 @@ try {
         Write-Host ""
 
         Write-Host "Applying file ACL change..."
-        Grant-FileBackedPrivateKeyRead -KeyPath $keyPath -Identity $identity -WhatIf:$WhatIf
+        Grant-FileBackedPrivateKeyRead -KeyPath $keyPath -Identity $identity -IdentitySid $identitySid
     }
 
     Write-Host ""
     Write-Host "Completed successfully."
+    exit 0
 }
 catch {
     Write-Error $_.Exception.Message

@@ -143,34 +143,34 @@ Since an immediate profile change is not feasible, you can grant the logged-in u
 ## Private Key ACL Remediation Script
 ### Overview
 
-The remediation script is a PowerShell script designed to run with SYSTEM-level privileges (for example, deployed as an Iru Custom Script via the Iru Agent). It performs the following operations:
+The remediation script is a PowerShell script designed to run with SYSTEM-level privileges (for example, deployed as an Iru Custom Script via the Iru Agent). The current script version is 2.0; see the `.NOTES` section of the script header for the full changelog. It performs the following operations:
 
 1. Detects the currently logged-in interactive user and resolves their SID.
-2. Searches the Local Machine certificate store for the best-matching Okta/SCEP certificate using a scoring algorithm based on configurable search hints (e.g., your Okta tenant identifier, “Okta,” “SCEP”), the presence of a private key, current validity, and Client Authentication extended key usage.
+2. Selects the target certificate from the Local Machine store — either deterministically (via an exact -Thumbprint, or an -IssuerMatch regex applied to the Issuer DN) or heuristically, by scoring candidates against configurable search hints and the Client Authentication extended key usage. Only currently valid certificates with a private key are considered, and the heuristic fails closed if no hint matches.
 3. Determines whether the private key is backed by a CNG (Cryptography Next Generation) provider or a legacy CSP (Cryptographic Service Provider).
 4. Grants the logged-in user GENERIC_READ access to the private key, using either the NCrypt DACL API (for CNG keys) or file-system ACL modification (for legacy file-backed keys).
 
 ### Script Parameters
 | **Parameter** | **Type** | **Default** | **Description** |
 | --- | --- | --- | --- |
-| $SearchHints | String[] | See below | Array of keywords used to score and identify the correct certificate. Include your Okta tenant identifier. |
-| $MinimumScore | Int | 50 | Minimum confidence score required to proceed with a certificate match. |
-| $WhatIf | Switch | False | When set, the script reports what changes it would make without actually modifying any ACLs. Use this for testing. |
+| $Thumbprint | String | None | Exact SHA-1 thumbprint of the target certificate. Bypasses all heuristics. Note that SCEP renewal reissues the certificate with a new thumbprint, so a pinned thumbprint stops matching after renewal. |
+| $IssuerMatch | String | None | Regex applied to the Issuer DN as a hard filter before scoring. Survives certificate renewal; recommended for production deployments. |
+| $SearchHints | String[] | 'Okta', 'SCEP' | Keywords matched case-insensitively against the certificate Subject, Issuer, FriendlyName, and DNS SANs. Each match adds 40 points. Extend with a tenant-specific identifier. |
+| $MinimumScore | Int | 40 | Minimum score required to act. The default requires at least one SearchHints match; the Client Authentication EKU alone (30 points) is deliberately insufficient. |
+| $WhatIf | Switch | False | Reports the changes the script would make without modifying any ACLs (standard ShouldProcess support; -Confirm is also available). Use this for testing. |
 
 > [!NOTE]
-> Customize the $SearchHints array to include your Okta tenant-specific identifier (e.g., your Okta org subdomain or a unique string from the certificate subject/issuer). This helps the scoring algorithm correctly identify the Okta SCEP certificate among all certificates in the Local Machine store.
+> Customize the $SearchHints array to include your Okta tenant-specific identifier (e.g., your Okta org subdomain or a unique string from the certificate subject/issuer), or skip the heuristic entirely with -IssuerMatch or -Thumbprint. This ensures the script identifies the Okta SCEP certificate among all certificates in the Local Machine store.
 
 ### Certificate Scoring Algorithm
-The script uses a point-based scoring system to identify the correct certificate from the Local Machine store:
+When no -Thumbprint is supplied, the script scores candidates to identify the correct certificate. Having a private key, being currently valid (within NotBefore/NotAfter), and matching -IssuerMatch (when set) are hard requirements applied before scoring — they carry no points, because every surviving candidate satisfies them:
 
 | **Criterion** | **Points** | **Rationale** |
 | --- | --- | --- |
-| Certificate has a private key | +20 | Required for signing |
-| Certificate is currently valid (within NotBefore/NotAfter) | +20 | Expired certs not useful |
-| Client Authentication EKU (OID 1.3.6.1.5.5.7.3.2) present | +30 | Required for Okta |
-| Each SearchHint keyword match in Subject/Issuer/FriendlyName | +25 each | Tenant identification |
+| Client Authentication EKU (OID 1.3.6.1.5.5.7.3.2) present | +30 | Required for Okta, but common to many certificates (MDM enrollment, EAP-TLS), so it is deliberately insufficient on its own |
+| Each SearchHint keyword match in Subject/Issuer/FriendlyName/DNS SANs | +40 each | Tenant identification — at least one match is required to clear the default threshold of 40 |
 
-The certificate with the highest score above the MinimumScore threshold is selected. In case of a tie, the certificate with the latest expiration date is preferred.
+The certificate with the highest score at or above the MinimumScore threshold is selected, and selection fails closed: if no candidate reaches the threshold, the script exits without modifying anything. Ties are resolved by subject — certificates with the same Subject tying on score (the renewal-overlap case) resolve to the latest NotAfter, while distinct certificates tying on score abort the script with guidance to re-run with -IssuerMatch or -Thumbprint.
 
 ### How the Script Works
 **Step 1: User Detection**
@@ -179,7 +179,7 @@ The script first attempts to identify the logged-in user via Win32_ComputerSyste
 
 **Step 2: Certificate Selection**
 
-All certificates in Cert:\LocalMachine\My with a private key and valid date range are evaluated. Each is scored using the algorithm above, and the top candidate is selected.
+If -Thumbprint is supplied, the certificate is looked up directly and heuristics are skipped. Otherwise, all certificates in Cert:\LocalMachine\My with a private key and valid date range (optionally narrowed by -IssuerMatch) are scored using the algorithm above, and the top candidate is selected — subject to the fail-closed threshold and the ambiguity guard described in the scoring section.
 
 **Step 3: Key Type Detection**
 
@@ -190,7 +190,7 @@ The script attempts to access the private key as an RSA CNG key or an ECDSA CNG 
 For CNG-backed keys, the script uses the NCrypt API (via P/Invoke) to read the existing DACL security descriptor, add a GENERIC_READ ACE for the logged-in user’s SID, and write the updated descriptor back. For legacy file-backed keys, it locates the private key file on disk and applies a standard file-system Read ACL entry.
 
 ### Deployment via Iru
-The script should be deployed as a Custom Script in Iru, assigned to the same Blueprint as the SCEP profile. Ensure it runs with SYSTEM-level privileges. It can also be run manually on individual devices for troubleshooting.
+The script should be deployed as a Custom Script in Iru, assigned to the same Blueprint as the SCEP profile. Ensure it runs with SYSTEM-level privileges. It can also be run manually on individual devices for troubleshooting. For production deployments, prefer pinning the certificate with -IssuerMatch over -Thumbprint: SCEP renewal reissues the certificate with a new thumbprint, while the issuer stays stable across renewals.
 
 - [Grant-OktaSCEPPrivateKeyAccess.ps1](Grant-OktaSCEPPrivateKeyAccess.ps1)
 
@@ -210,10 +210,11 @@ Once devices are showing as “Managed” in the Okta device directory, you can 
 | **Symptom** | **Resolution** |
 | --- | --- |
 | Device shows as “Registered” but not “Managed” in Okta | Confirm the SCEP certificate was deployed successfully in the Iru device record. Check the Okta System Log for a “Bind client certificate to device” event. If missing, the certificate may not have reached Okta. |
-| Script reports “Could not confidently identify the certificate” | Adjust the $SearchHints parameter to include more specific identifiers from your Okta tenant or certificate subject. Lower the $MinimumScore if needed, but verify the selected certificate is correct. |
+| Script reports “Could not confidently identify the Okta/SCEP certificate” | Add a tenant-specific identifier to $SearchHints, or target the certificate deterministically with -IssuerMatch or -Thumbprint. Avoid lowering $MinimumScore below 40 — that removes the requirement for a hint match, and the script may select an unrelated client-authentication certificate. |
+| Script aborts with “Ambiguous match” | Two distinct certificates scored identically. Re-run with -IssuerMatch (recommended) or -Thumbprint to disambiguate. |
 | Certificate is present but Okta Verify cannot use it | Run the remediation script with -WhatIf first to confirm it identifies the correct certificate and key. Then run without -WhatIf. Restart Okta Verify after the ACL change. |
 | Script fails with “No interactive user logged in” | The script must run while a user is interactively logged in. Ensure it is not running during device provisioning before a user has signed in. |
-| NCryptSetProperty fails on the key | If the key is TPM-backed, some TPM providers may not support DACL modification. Verify the provider name in the script output and consult Iru support. |
+| Script reports the provider does not support key security descriptors | The script checks NCrypt security-descriptor support before attempting the change. If the key’s provider (for example, some TPM configurations) does not report support, the ACL cannot be modified through NCrypt. Verify the provider name in the script output and consult Iru support. |
 
 ## References
 - Iru SCEP Library Item Documentation: [https://docs.iru.com/en/endpoint/library/library-items-profiles/configure-the-scep-library-item](https://docs.iru.com/en/endpoint/library/library-items-profiles/configure-the-scep-library-item)
