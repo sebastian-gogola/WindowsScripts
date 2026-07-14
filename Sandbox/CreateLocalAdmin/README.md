@@ -1,4 +1,4 @@
-# Create-LocalAdmin.ps1
+# CreateLocalAdmin.ps1
 
 A production-ready PowerShell script for creating a local administrator account on Windows 11 endpoints, designed for deployment via MDM platforms (Iru) that support pushing custom PowerShell scripts but lack native CSP support for local user management.
 
@@ -109,7 +109,7 @@ All configuration is done through variables at the top of the script. No command
 
 The following instructions use Intune as the example, but the process is similar for other MDM platforms.
 
-**Step 1: Customize the script.** Open `Create-LocalAdmin.ps1` and update the configuration variables at the top. At a minimum, change `$AdminUsername` and `$AdminPassword`. Review the optional flags and set them according to your requirements.
+**Step 1: Customize the script.** Open `CreateLocalAdmin.ps1` and update the configuration variables at the top. At a minimum, change `$AdminUsername` and `$AdminPassword`. Review the optional flags and set them according to your requirements.
 
 **Step 2: Upload to your MDM.** In the Intune portal, navigate to Devices > Scripts and remediations > Platform scripts > Add (Windows 10 and later). Upload the `.ps1` file.
 

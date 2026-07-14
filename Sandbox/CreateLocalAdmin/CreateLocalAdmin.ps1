@@ -4,7 +4,7 @@
     Designed for deployment via MDM (Intune, Workspace ONE, etc.).
 
 .DESCRIPTION
-    This script is idempotent — safe to run multiple times on the same device.
+    This script is idempotent - safe to run multiple times on the same device.
     It creates a local admin account, adds it to the Administrators group using
     the well-known SID (S-1-5-32-544) for language-neutral compatibility, sets
     the password to never expire, optionally hides it from the login screen, and
@@ -26,12 +26,19 @@
     those over hardcoding. Rotate this password periodically.
 #>
 
+# =============================================================================
+# DISCLAIMER: Experimental helper script - provided as-is, without warranty or
+# official Iru support. Sandbox scripts have not gone through the review and
+# validation applied to the official Iru WindowsScripts. Review the code and
+# validate on test hardware before any production use.
+# =============================================================================
+
 # ============================================================================
-# CONFIGURATION — Update these values before deploying
+# CONFIGURATION - Update these values before deploying
 # ============================================================================
 
 $AdminUsername    = "LocalITAdmin"                  # Name for the new local admin account
-$AdminPassword    = "Ch@ngeM3!2026Dep10y"           # Static password — change before deploying
+$AdminPassword    = "Ch@ngeM3!2026Dep10y"           # Static password - change before deploying
 $AdminDescription = "MDM-managed local admin"       # Account description shown in lusrmgr.msc
 
 # --- Optional Features ---
@@ -96,7 +103,7 @@ try {
         $existingUser = Get-LocalUser -Name $AdminUsername -ErrorAction Stop
     }
     catch {
-        # Account does not exist — expected path on first run
+        # Account does not exist - expected path on first run
     }
 
     if ($existingUser) {
@@ -153,7 +160,7 @@ try {
     #
     #    Creates a DWORD value of 0 under the SpecialAccounts\UserList
     #    registry key. The account can still be used via "Other user",
-    #    runas, RDP, or PowerShell — it is only hidden from the UI.
+    #    runas, RDP, or PowerShell - it is only hidden from the UI.
     # ------------------------------------------------------------------
     if ($HideFromLogin) {
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
@@ -172,7 +179,7 @@ try {
         Write-Log "Account hidden from login screen via registry."
     }
     else {
-        Write-Log "HideFromLogin is disabled — account will be visible on the login screen."
+        Write-Log "HideFromLogin is disabled - account will be visible on the login screen."
     }
 
     # ------------------------------------------------------------------
@@ -199,7 +206,7 @@ try {
         }
     }
     else {
-        Write-Log "DisableBuiltIn is disabled — built-in Administrator account left unchanged."
+        Write-Log "DisableBuiltIn is disabled - built-in Administrator account left unchanged."
     }
 
     # ------------------------------------------------------------------
@@ -219,7 +226,7 @@ try {
     exit 0
 }
 catch {
-    Write-Log "FATAL — Unhandled exception: $($_.Exception.Message)" -Level "ERROR"
+    Write-Log "FATAL - Unhandled exception: $($_.Exception.Message)" -Level "ERROR"
     Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
     Write-Log "========== Script execution FAILED ==========" -Level "ERROR"
 

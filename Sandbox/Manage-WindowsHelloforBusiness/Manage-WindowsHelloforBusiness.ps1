@@ -77,6 +77,13 @@
     policy is what you want for org-wide enforcement).
 #>
 
+# =============================================================================
+# DISCLAIMER: Experimental helper script - provided as-is, without warranty or
+# official Iru support. Sandbox scripts have not gone through the review and
+# validation applied to the official Iru WindowsScripts. Review the code and
+# validate on test hardware before any production use.
+# =============================================================================
+
 [CmdletBinding()]
 param(
     [ValidateSet('Audit', 'Enforce')]
@@ -86,7 +93,7 @@ param(
 )
 
 # =====================================================================================
-# DESIRED STATE — edit this block per customer/policy requirements.
+# DESIRED STATE - edit this block per customer/policy requirements.
 # $null = Not Configured (value will be removed). Anything else is enforced.
 # =====================================================================================
 $PFW = 'HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork'
@@ -186,7 +193,7 @@ $Config = @(
 )
 
 # =====================================================================================
-# Implementation — no edits needed below this line
+# Implementation - no edits needed below this line
 # =====================================================================================
 $script:ExitCode = 0
 $script:Drift    = [System.Collections.Generic.List[string]]::new()
@@ -226,10 +233,10 @@ function Invoke-Setting {
                 Remove-ItemProperty -Path $Setting.Path -Name $Setting.Value -Force -ErrorAction Stop
                 Write-Log ('REMOVED  : {0} (was {1})' -f $Setting.Name, $current)
             } else {
-                Write-Log ('DRIFT    : {0} — present ({1}), expected Not Configured' -f $Setting.Name, $current) 'WARN'
+                Write-Log ('DRIFT    : {0} - present ({1}), expected Not Configured' -f $Setting.Name, $current) 'WARN'
             }
         } else {
-            Write-Log ('OK       : {0} — Not Configured' -f $Setting.Name)
+            Write-Log ('OK       : {0} - Not Configured' -f $Setting.Name)
         }
         return
     }
@@ -251,12 +258,12 @@ function Invoke-Setting {
         Write-Log ('SET      : {0} = {1} (was {2})' -f $Setting.Name, $desired, $was)
     } else {
         $cur = if ($null -eq $current) { '<absent>' } else { $current }
-        Write-Log ('DRIFT    : {0} — current {1}, expected {2}' -f $Setting.Name, $cur, $desired) 'WARN'
+        Write-Log ('DRIFT    : {0} - current {1}, expected {2}' -f $Setting.Name, $cur, $desired) 'WARN'
     }
 }
 
 # --- Main ---
-Write-Log ('===== Windows Hello for Business policy — Mode: {0} =====' -f $Mode)
+Write-Log ('===== Windows Hello for Business policy - Mode: {0} =====' -f $Mode)
 
 # Guard: must be elevated/SYSTEM to touch HKLM policies
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -270,7 +277,7 @@ foreach ($setting in $Config) {
     try {
         Invoke-Setting -Setting $setting
     } catch {
-        Write-Log ('ERROR    : {0} — {1}' -f $setting.Name, $_.Exception.Message) 'ERROR'
+        Write-Log ('ERROR    : {0} - {1}' -f $setting.Name, $_.Exception.Message) 'ERROR'
         $script:ExitCode = 1
     }
 }
@@ -278,7 +285,7 @@ foreach ($setting in $Config) {
 # --- Summary & exit-code semantics ---
 if ($Mode -eq 'Audit') {
     if ($script:Drift.Count -gt 0) {
-        Write-Log ('AUDIT RESULT: NON-COMPLIANT — {0} setting(s) drifted: {1}' -f $script:Drift.Count, ($script:Drift -join '; ')) 'WARN'
+        Write-Log ('AUDIT RESULT: NON-COMPLIANT - {0} setting(s) drifted: {1}' -f $script:Drift.Count, ($script:Drift -join '; ')) 'WARN'
         exit 1   # non-zero -> Iru can trigger remediation
     }
     Write-Log 'AUDIT RESULT: COMPLIANT'

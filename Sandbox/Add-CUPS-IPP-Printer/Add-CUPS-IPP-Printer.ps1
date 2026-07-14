@@ -10,7 +10,14 @@
     - Runs in SYSTEM context, so the printer is installed machine-wide
       (available to all users on the device).
 #>
- 
+
+# =============================================================================
+# DISCLAIMER: Experimental helper script - provided as-is, without warranty or
+# official Iru support. Sandbox scripts have not gone through the review and
+# validation applied to the official Iru WindowsScripts. Review the code and
+# validate on test hardware before any production use.
+# =============================================================================
+
 # --- Configuration --------------------------------------------------------
 $PrinterName = 'Hall-A-Front'        # Name shown to users in Windows
 $ServerHost  = '192.168.1.1'         # CUPS server (Raspberry Pi) LAN address

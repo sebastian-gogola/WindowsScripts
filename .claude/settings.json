@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(/Iru WindowsScripts/**)",
+      "Write(/Iru WindowsScripts/**)"
+    ]
+  }
+}

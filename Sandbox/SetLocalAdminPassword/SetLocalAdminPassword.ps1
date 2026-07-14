@@ -17,8 +17,15 @@
     API Docs: https://api-docs.iru.com
 #>
 
+# =============================================================================
+# DISCLAIMER: Experimental helper script - provided as-is, without warranty or
+# official Iru support. Sandbox scripts have not gone through the review and
+# validation applied to the official Iru WindowsScripts. Review the code and
+# validate on test hardware before any production use.
+# =============================================================================
+
 # ========================================================================================
-# CONFIGURATION — Update these values before deploying
+# CONFIGURATION - Update these values before deploying
 # ========================================================================================
 
 # Iru API settings
@@ -191,7 +198,7 @@ function Set-LocalAdminPassword {
         Write-Log "Password updated for $Username"
     }
     catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
-        Write-Log "Account '$Username' not found — creating it." -Level "WARN"
+        Write-Log "Account '$Username' not found - creating it." -Level "WARN"
         New-LocalUser -Name $Username `
                       -Password $securePass `
                       -Description "Iru LAPS managed admin" `
@@ -217,7 +224,7 @@ function Install-LapsScheduledTask {
     # Check if task already exists
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-Log "Scheduled task '$TaskName' already exists — skipping install."
+        Write-Log "Scheduled task '$TaskName' already exists - skipping install."
         return
     }
 
@@ -241,7 +248,7 @@ function Install-LapsScheduledTask {
             $scriptContent | Out-File -FilePath $ScriptInstallPath -Encoding UTF8 -Force
         }
         else {
-            Write-Log "Cannot determine script source to copy. Task will point to $ScriptInstallPath — ensure the file exists." -Level "ERROR"
+            Write-Log "Cannot determine script source to copy. Task will point to $ScriptInstallPath - ensure the file exists." -Level "ERROR"
             return
         }
     }
@@ -279,7 +286,7 @@ function Install-LapsScheduledTask {
         -Description "Iru LAPS: Rotates the local admin password every $RotationDays days and posts it to Iru device notes." `
         -Force | Out-Null
 
-    Write-Log "Scheduled task '$TaskName' registered — runs every $RotationDays days at 2:00 AM as SYSTEM."
+    Write-Log "Scheduled task '$TaskName' registered - runs every $RotationDays days at 2:00 AM as SYSTEM."
 }
 
 # ========================================================================================

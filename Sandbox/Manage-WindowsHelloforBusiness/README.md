@@ -1,4 +1,4 @@
-# Manage-WindowsHelloForBusiness.ps1
+# Manage-WindowsHelloforBusiness.ps1
 
 PowerShell script for managing **Windows Hello for Business (WHfB)** policy on Windows endpoints enrolled in **Iru MDM**, replicating the full Intune **"Windows Hello for Business"** settings catalog category (36 settings) without requiring Intune enrollment.
 
