@@ -23,7 +23,7 @@ The question that prompted this solution: is [Policy CSP – ADMX_RemovableStora
 | Registry store | `HKLM\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{classGUID}` | `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions` |
 | Non-storage peripherals | Unaffected (it only addresses storage classes) | Unaffected by this design (see below) |
 
-`ADMX_RemovableStorage` is the right tool for a blunt, no-exceptions "nobody reads/writes removable disks" posture — that's what the earlier `Block-RemovableStorage.ps1` in this repo implements. The moment the requirement includes *"…except these sanctioned devices,"* the correct documentation is:
+`ADMX_RemovableStorage` is the right tool for a blunt, no-exceptions "nobody reads/writes removable disks" posture — that's what [`Block-RemovableStorage.ps1`](../Block-RemovableStorage/) in this repo implements (its `FullBlock` posture denies everything; `ReadOnly` denies writes only). The moment the requirement includes *"…except these sanctioned devices,"* the correct documentation is:
 
 - [Policy CSP – DeviceInstallation](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-deviceinstallation) — the policy reference this script implements
 - [Manage Device Installation with Group Policy](https://learn.microsoft.com/en-us/windows/client-management/client-tools/manage-device-installation-with-group-policy) — Microsoft's scenario guide, including the block-all/allow-one-thumb-drive pattern
