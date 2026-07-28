@@ -3,7 +3,7 @@
 ################################################################################################
 #
 #   Created - 2025/11/08
-#   Updated - 2026/01/05
+#   Updated - 2026-07-27
 #
 ################################################################################################
 # Script Information
@@ -43,7 +43,7 @@
 ################################################################################################
 
 # Script version
-# VERSION="1.0.2"
+# VERSION="1.2.0"
 
 
 param(
@@ -55,7 +55,8 @@ param(
     [string[]]$UninstallApp,
     [switch]$Debug,
     [switch]$Silent,
-    [switch]$ForceRemigration
+    [switch]$ForceRemigration,
+    [switch]$DiagnoseOnly
 )
 
 # ---------------------------------------------------------------------------------
@@ -82,11 +83,57 @@ $ErrorActionPreference = "Stop"
 $script:DebugMode = $false
 $script:LogFile = $null
 $script:mdmModuleHandle = [IntPtr]::Zero
+$script:BackupDir = $null
+
+# Registry roots touched during unenrollment cleanup. Paths are relative to HKLM.
+$script:EnrollmentsRoot           = "SOFTWARE\Microsoft\Enrollments"
+$script:OmadmAccountsRoot         = "SOFTWARE\Microsoft\Provisioning\OMADM\Accounts"
+$script:OmadmLoggerRoot           = "SOFTWARE\Microsoft\Provisioning\OMADM\Logger"
+$script:TrackedRoot               = "SOFTWARE\Microsoft\EnterpriseResourceManager\Tracked"
+$script:DeclaredConfigConfigRoot  = "SOFTWARE\Microsoft\DeclaredConfiguration\HostOS\Config\enrollments"
+$script:DeclaredConfigResultsRoot = "SOFTWARE\Microsoft\DeclaredConfiguration\HostOS\Results\Config\enrollments"
+$script:DmOrchestratorRoot        = "SOFTWARE\Microsoft\DMOrchestrator"
+$script:TaskCacheTasksRoot        = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks"
+$script:TaskCacheTreeEnterprise   = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\EnterpriseMgmt"
+$script:EnterpriseMgmtTaskPath    = "\Microsoft\Windows\EnterpriseMgmt"
+
+# WMI namespace for the MDM bridge provider, used for the LinkedEnrollment/Unenroll probe.
+$script:MdmBridgeNamespace        = "root\cimv2\mdm\dmmap"
+
+# Registry roots this script may delete from. A deletion target must sit strictly below one of
+# these and be scoped to a single identifier, so a malformed path cannot reach outside the MDM
+# enrollment footprint. PolicyManager appears only as Providers and AdmxInstalled - never current
+# or default, which are shared by every provider including the primary enrollment's policy state.
+$script:DeletableRoots = @(
+    "SOFTWARE\Microsoft\Enrollments",
+    "SOFTWARE\Microsoft\Provisioning\OMADM",
+    "SOFTWARE\Microsoft\PolicyManager\Providers",
+    "SOFTWARE\Microsoft\PolicyManager\AdmxInstalled",
+    "SOFTWARE\Microsoft\EnterpriseResourceManager\Tracked",
+    "SOFTWARE\Microsoft\DeclaredConfiguration",
+    "SOFTWARE\Microsoft\DMOrchestrator",
+    "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache"
+)
+
+# Distinct from 1 (generic failure) and from the HRESULT-derived registration codes, so a run
+# that stopped because the old MDM survived is distinguishable in reporting from one where
+# registration itself was rejected.
+$script:ExitCodeResidualStateBlocked = 3
+
+# Populated as the run progresses and rendered once by Write-RunSummary, so a failed migration can
+# be diagnosed from the tail of the log instead of by correlating interleaved lines.
+$script:EnrollmentOutcomes  = [ordered]@{}
+$script:SummaryMmpcTask     = "not attempted"
+$script:SummaryMmpcFlag     = "not attempted"
+$script:SummaryCleanSlate   = "not reached"
+$script:SummaryRegistration = "not reached"
 
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)][string]$Level,
-        [Parameter(Mandatory = $true)][string]$Message
+        # Empty is legitimate: the run summary emits blank lines to separate sections. A mandatory
+        # string parameter rejects "" by default, which threw from inside the finally block.
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
     )
 
     $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
@@ -1102,6 +1149,1171 @@ function Register-WithMdm {
 }
 
 
+function Test-IsSystemAccount {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity.IsSystem) {
+            return $true
+        }
+        return ($identity.Name -eq "NT AUTHORITY\SYSTEM")
+    } catch {
+        return $false
+    }
+}
+
+function Get-HklmKeyValue {
+    param(
+        [Parameter(Mandatory=$true)][string]$SubKeyPath,
+        [Parameter(Mandatory=$true)][string]$ValueName
+    )
+
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey($SubKeyPath)
+        if (-not $key) { return $null }
+        return $key.GetValue($ValueName, $null)
+    } catch {
+        return $null
+    } finally {
+        if ($key) { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
+function Get-HklmSubKeyNames {
+    param([Parameter(Mandatory=$true)][string]$SubKeyPath)
+
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey($SubKeyPath)
+        if (-not $key) { return @() }
+        return @($key.GetSubKeyNames())
+    } catch {
+        return @()
+    } finally {
+        if ($key) { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
+function Get-HklmValueNames {
+    param([Parameter(Mandatory=$true)][string]$SubKeyPath)
+
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey($SubKeyPath)
+        if (-not $key) { return @() }
+        return @($key.GetValueNames())
+    } catch {
+        return @()
+    } finally {
+        if ($key) { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
+function Get-BackupDirectory {
+    if ($script:BackupDir) {
+        return $script:BackupDir
+    }
+
+    try {
+        $programData = [Environment]::GetFolderPath("CommonApplicationData")
+        $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+        $dir = Join-Path (Join-Path (Join-Path (Join-Path $programData "Iru") "MDMMigration") "Backups") $stamp
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $script:BackupDir = $dir
+        Log-Info ("Registry backup directory: {0}" -f $dir)
+    } catch {
+        Log-Warn ("Failed to create registry backup directory: {0}" -f $_.Exception.Message)
+        return $null
+    }
+
+    return $script:BackupDir
+}
+
+function Backup-RegistryKey {
+    param(
+        [Parameter(Mandatory=$true)][string]$SubKeyPath,
+        [string]$Label
+    )
+
+    $dir = Get-BackupDirectory
+    if (-not $dir) { return $false }
+
+    if ([string]::IsNullOrWhiteSpace($Label)) {
+        $Label = $SubKeyPath
+    }
+
+    $safeLabel = ($Label -replace '[\\/:*?"<>|]', '-')
+    if ($safeLabel.Length -gt 120) {
+        $safeLabel = $safeLabel.Substring($safeLabel.Length - 120)
+    }
+
+    $file = Join-Path $dir ("{0}.reg" -f $safeLabel)
+    $fullKey = "HKLM\" + $SubKeyPath
+
+    try {
+        $null = & reg.exe export $fullKey $file /y 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Log-Debug ("Backed up '{0}' to '{1}'." -f $fullKey, $file)
+            return $true
+        }
+        Log-Warn ("reg.exe export of '{0}' returned exit code {1}; continuing without a backup of that key." -f $fullKey, $LASTEXITCODE)
+        return $false
+    } catch {
+        Log-Warn ("Failed to back up '{0}': {1}" -f $fullKey, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Test-IsSafeDeletionPath {
+    # Every key this script deletes belongs to exactly one record - an enrollment, a scheduled
+    # task, or a DMOrchestrator session. Rather than trying to enumerate which parent keys are
+    # shared, assert that ownership positively: the path must sit strictly below a root this
+    # script is allowed to touch, and the identifier it claims to be scoped to must appear as a
+    # complete segment of it.
+    #
+    # That covers the failure this guard exists for. A blank identifier turns
+    # "Enrollments\Status\$id" into "Enrollments\Status", which exists and would take every
+    # enrollment's status with it; such a path is no longer strictly below the root and no longer
+    # carries a scoping segment, so it fails on both counts without anyone having to have
+    # predicted "Status" was dangerous.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$SubKeyPath,
+        [AllowEmptyString()][string]$ScopeId = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SubKeyPath)) {
+        Log-Error "Refusing to delete an empty registry path."
+        return $false
+    }
+
+    # Fail closed rather than making this parameter mandatory: an unsatisfied mandatory parameter
+    # prompts, and this script runs unattended as SYSTEM where a prompt would hang the migration.
+    if ([string]::IsNullOrWhiteSpace($ScopeId)) {
+        Log-Error ("Refusing to delete '{0}': no scoping identifier was supplied, so the path cannot be confirmed to target a single record." -f $SubKeyPath)
+        return $false
+    }
+
+    if ($SubKeyPath.EndsWith("\") -or $SubKeyPath.Contains("\\")) {
+        Log-Error ("Refusing to delete '{0}': the path has an empty segment, which means an identifier was blank." -f $SubKeyPath)
+        return $false
+    }
+
+    $matchedRoot = $null
+    foreach ($root in $script:DeletableRoots) {
+        # The trailing separator is what makes this "strictly below": a root on its own never matches.
+        if ($SubKeyPath.StartsWith(($root + "\"), [System.StringComparison]::InvariantCultureIgnoreCase)) {
+            $matchedRoot = $root
+            break
+        }
+    }
+
+    if ($null -eq $matchedRoot) {
+        Log-Error ("Refusing to delete '{0}': it is not strictly below any registry root this script may modify." -f $SubKeyPath)
+        return $false
+    }
+
+    $isScoped = $false
+    foreach ($segment in $SubKeyPath.Split("\")) {
+        if ($segment -ieq $ScopeId) {
+            $isScoped = $true
+            break
+        }
+    }
+
+    if (-not $isScoped) {
+        Log-Error ("Refusing to delete '{0}': it does not contain the identifier '{1}' that it is supposed to be scoped to." -f $SubKeyPath, $ScopeId)
+        return $false
+    }
+
+    Log-Debug ("Deletion path '{0}' is scoped to '{1}' under permitted root '{2}'." -f $SubKeyPath, $ScopeId, $matchedRoot)
+    return $true
+}
+
+function Remove-HklmKeyWithBackup {
+    param(
+        [Parameter(Mandatory=$true)][string]$SubKeyPath,
+        [AllowEmptyString()][string]$ScopeId = "",
+        [string]$Label,
+        [string]$Reason
+    )
+
+    if (-not (Test-IsSafeDeletionPath -SubKeyPath $SubKeyPath -ScopeId $ScopeId)) {
+        return $false
+    }
+
+    $psPath = "HKLM:\" + $SubKeyPath
+
+    try {
+        if (-not (Test-Path -LiteralPath $psPath)) {
+            Log-Debug ("Registry key does not exist (skipping): {0}" -f $psPath)
+            return $false
+        }
+    } catch {
+        Log-Debug ("Failed to test registry key '{0}': {1}" -f $psPath, $_.Exception.Message)
+        return $false
+    }
+
+    $null = Backup-RegistryKey -SubKeyPath $SubKeyPath -Label $Label
+
+    try {
+        Remove-Item -LiteralPath $psPath -Recurse -Force -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Log-Info ("Removed registry key: {0}" -f $psPath)
+        } else {
+            Log-Info ("Removed registry key: {0} [{1}]" -f $psPath, $Reason)
+        }
+        return $true
+    } catch {
+        Log-Warn ("Failed to remove registry key '{0}': {1}" -f $psPath, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Remove-HklmValueWithBackup {
+    param(
+        [Parameter(Mandatory=$true)][string]$SubKeyPath,
+        [Parameter(Mandatory=$true)][string]$ValueName,
+        [string]$Label,
+        [string]$Reason
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SubKeyPath) -or $SubKeyPath.Contains("\\")) {
+        Log-Error ("Refusing to remove value '{0}': the containing path '{1}' is malformed." -f $ValueName, $SubKeyPath)
+        return $false
+    }
+
+    $psPath = "HKLM:\" + $SubKeyPath
+
+    try {
+        if (-not (Test-Path -LiteralPath $psPath)) {
+            return $false
+        }
+        $existing = Get-ItemProperty -LiteralPath $psPath -Name $ValueName -ErrorAction SilentlyContinue
+        if ($null -eq $existing) {
+            Log-Debug ("Value '{0}' not present under '{1}' (skipping)." -f $ValueName, $psPath)
+            return $false
+        }
+    } catch {
+        return $false
+    }
+
+    $null = Backup-RegistryKey -SubKeyPath $SubKeyPath -Label $Label
+
+    try {
+        Remove-ItemProperty -LiteralPath $psPath -Name $ValueName -Force -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Log-Info ("Removed registry value '{0}' from '{1}'." -f $ValueName, $psPath)
+        } else {
+            Log-Info ("Removed registry value '{0}' from '{1}' [{2}]." -f $ValueName, $psPath, $Reason)
+        }
+        return $true
+    } catch {
+        Log-Warn ("Failed to remove registry value '{0}' from '{1}': {2}" -f $ValueName, $psPath, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Set-HklmDwordWithBackup {
+    param(
+        [Parameter(Mandatory=$true)][string]$SubKeyPath,
+        [Parameter(Mandatory=$true)][string]$ValueName,
+        [Parameter(Mandatory=$true)][int]$Value,
+        [string]$Label,
+        [string]$Reason
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SubKeyPath) -or $SubKeyPath.Contains("\\")) {
+        Log-Error ("Refusing to set value '{0}': the containing path '{1}' is malformed." -f $ValueName, $SubKeyPath)
+        return $false
+    }
+
+    $psPath = "HKLM:\" + $SubKeyPath
+
+    try {
+        if (-not (Test-Path -LiteralPath $psPath)) {
+            Log-Debug ("Key '{0}' does not exist; nothing to set." -f $psPath)
+            return $false
+        }
+    } catch {
+        return $false
+    }
+
+    $null = Backup-RegistryKey -SubKeyPath $SubKeyPath -Label $Label
+
+    try {
+        Set-ItemProperty -LiteralPath $psPath -Name $ValueName -Value $Value -Type DWord -Force -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Log-Info ("Set registry value '{0}' to {1} under '{2}'." -f $ValueName, $Value, $psPath)
+        } else {
+            Log-Info ("Set registry value '{0}' to {1} under '{2}' [{3}]." -f $ValueName, $Value, $psPath, $Reason)
+        }
+        return $true
+    } catch {
+        Log-Warn ("Failed to set registry value '{0}' under '{1}': {2}" -f $ValueName, $psPath, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-MmpcFlagValueAsInt {
+    # Returns -1 when the value cannot be interpreted as a number, so callers treat an
+    # unparseable flag as suspect rather than as zero.
+    param($RawValue)
+
+    if ($null -eq $RawValue) { return 0 }
+
+    try {
+        return [int]$RawValue
+    } catch {
+        return -1
+    }
+}
+
+function Test-IsMmpcEnrollmentValues {
+    # Heuristic fallback used only when the authoritative LinkedEnrollmentId cross-reference is
+    # unavailable. Any single indicator is sufficient.
+    #
+    # These identifiers belong to the Microsoft MMPC service itself, not to whichever MDM set the
+    # link up, so they hold for any provider that adopts declared configuration - deliberately no
+    # vendor-specific matching here.
+    param(
+        [string]$ProviderId,
+        [string]$DiscoveryUrl,
+        [string]$EnrollmentType,
+        [string]$AadResourceId
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ProviderId) -and $ProviderId.Trim() -ieq 'Microsoft Device Management') { return $true }
+    if (-not [string]::IsNullOrWhiteSpace($DiscoveryUrl) -and $DiscoveryUrl -imatch 'discovery\.dm\.microsoft\.com') { return $true }
+    if (-not [string]::IsNullOrWhiteSpace($AadResourceId) -and $AadResourceId -imatch 'checkin\.dm\.microsoft\.com') { return $true }
+    if (-not [string]::IsNullOrWhiteSpace($EnrollmentType) -and $EnrollmentType.Trim() -ieq 'MMPCComplete') { return $true }
+
+    return $false
+}
+
+function Get-LinkedEnrollmentMap {
+    # The DMClient CSP writes LinkedEnrollment\LinkedEnrollmentId under the PRIMARY enrollment,
+    # naming the linked MMPC / declared-configuration enrollment. That is authoritative and
+    # removes any need to guess from discovery URLs.
+    # Returns a hashtable of linkedEnrollmentId -> primaryEnrollmentId.
+    $map = @{}
+
+    foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $script:EnrollmentsRoot)) {
+        if ($name -ieq "Status") { continue }
+
+        $linkedId = Get-HklmKeyValue -SubKeyPath ("{0}\{1}\LinkedEnrollment" -f $script:EnrollmentsRoot, $name) -ValueName "LinkedEnrollmentId"
+        if ($null -eq $linkedId) { continue }
+
+        $linkedId = ([string]$linkedId).Trim()
+        if ([string]::IsNullOrWhiteSpace($linkedId)) { continue }
+
+        $map[$linkedId] = $name
+        Log-Info ("Linked enrollment detected: primary '{0}' links to MMPC enrollment '{1}'." -f $name, $linkedId)
+    }
+
+    return $map
+}
+
+function Get-DmOrchestratorKeysForEnrollment {
+    # DMOrchestrator subkeys are named with their own unrelated GUIDs. Never match on the key
+    # name - correlate on the EnrollmentId value stored inside each key.
+    param([Parameter(Mandatory=$true)][string]$EnrollmentId)
+
+    $hits = @()
+
+    foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $script:DmOrchestratorRoot)) {
+        $value = Get-HklmKeyValue -SubKeyPath ("{0}\{1}" -f $script:DmOrchestratorRoot, $name) -ValueName "EnrollmentId"
+        if ($null -eq $value) { continue }
+        if (([string]$value).Trim() -ieq $EnrollmentId) {
+            $hits += $name
+        }
+    }
+
+    return $hits
+}
+
+function Get-EnrollStatusDescription {
+    param($Status)
+
+    switch ([string]$Status) {
+        "0" { return "Undefined" }
+        "1" { return "Enrollment not started" }
+        "2" { return "Enrollment in progress" }
+        "3" { return "Enrollment failed" }
+        "4" { return "Enrollment succeeded" }
+        "5" { return "Unenrollment not started" }
+        "6" { return "Unenrollment in progress" }
+        "7" { return "Unenrollment failed" }
+        "8" { return "Unenrollment succeeded" }
+        default { return "Unknown" }
+    }
+}
+
+function Get-EnrollmentArtifactMap {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [string]$PrimaryEnrollmentId
+    )
+
+    $taskCount = -1
+    try {
+        $taskCount = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -like "*$EnrollmentId*" }).Count
+    } catch {
+        Log-Debug ("Could not count scheduled tasks for '{0}': {1}" -f $EnrollmentId, $_.Exception.Message)
+    }
+
+    $linkedKeyPresent = $false
+    if (-not [string]::IsNullOrWhiteSpace($PrimaryEnrollmentId)) {
+        $linkedKeyPresent = Test-Path -LiteralPath ("HKLM:\{0}\{1}\LinkedEnrollment" -f $script:EnrollmentsRoot, $PrimaryEnrollmentId)
+    }
+
+    return [pscustomobject]@{
+        EnrollmentId          = $EnrollmentId
+        EnrollmentKey         = Test-Path -LiteralPath ("HKLM:\{0}\{1}" -f $script:EnrollmentsRoot, $EnrollmentId)
+        StatusKey             = Test-Path -LiteralPath ("HKLM:\{0}\Status\{1}" -f $script:EnrollmentsRoot, $EnrollmentId)
+        OmadmAccount          = Test-Path -LiteralPath ("HKLM:\{0}\{1}" -f $script:OmadmAccountsRoot, $EnrollmentId)
+        PolicyManagerProvider = Test-Path -LiteralPath ("HKLM:\SOFTWARE\Microsoft\PolicyManager\Providers\{0}" -f $EnrollmentId)
+        DeclaredConfigConfig  = Test-Path -LiteralPath ("HKLM:\{0}\{1}" -f $script:DeclaredConfigConfigRoot, $EnrollmentId)
+        DeclaredConfigResults = Test-Path -LiteralPath ("HKLM:\{0}\{1}" -f $script:DeclaredConfigResultsRoot, $EnrollmentId)
+        DmOrchestratorKeys    = @(Get-DmOrchestratorKeysForEnrollment -EnrollmentId $EnrollmentId).Count
+        LinkedEnrollmentKey   = $linkedKeyPresent
+        TaskCacheTree         = Test-Path -LiteralPath ("HKLM:\{0}\{1}" -f $script:TaskCacheTreeEnterprise, $EnrollmentId)
+        ScheduledTasks        = $taskCount
+    }
+}
+
+function Write-ArtifactMapLog {
+    param(
+        [Parameter(Mandatory=$true)]$Map,
+        [string]$Context
+    )
+
+    Log-Info ("Artifact map ({0}) for enrollment '{1}':" -f $Context, $Map.EnrollmentId)
+    foreach ($property in $Map.PSObject.Properties) {
+        if ($property.Name -eq "EnrollmentId") { continue }
+        Log-Info ("    {0,-22} = {1}" -f $property.Name, $property.Value)
+    }
+}
+
+function Write-ResidualGuidSweep {
+    # Log-only. Deletion is confined to the explicitly handled roots above, because this sweep
+    # can surface shared keys that must not be removed.
+    param([Parameter(Mandatory=$true)][string]$EnrollmentId)
+
+    try {
+        $output = & reg.exe query "HKLM\SOFTWARE\Microsoft" /f $EnrollmentId /s 2>&1
+
+        # reg.exe prints the containing key on its own line, then any matching values beneath it.
+        # Filtering to matching lines alone drops that context, so a value hit shows up as a bare
+        # name with no indication of where it lives. Carry the last key line forward.
+        $hits = @()
+        $currentKey = "(key unknown)"
+        $pattern = [regex]::Escape($EnrollmentId)
+
+        foreach ($line in $output) {
+            if ($null -eq $line) { continue }
+            $text = [string]$line
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+
+            if ($text.TrimStart().StartsWith("HKEY_", [System.StringComparison]::InvariantCultureIgnoreCase)) {
+                $currentKey = $text.Trim()
+                if ($text -imatch $pattern) {
+                    $hits += ("key    {0}" -f $currentKey)
+                }
+                continue
+            }
+
+            if ($text -imatch $pattern) {
+                $hits += ("value  {0}  ->  {1}" -f $currentKey, $text.Trim())
+            }
+        }
+
+        if ($hits.Count -eq 0) {
+            Log-Info ("Residual sweep: no remaining references to '{0}' under HKLM\SOFTWARE\Microsoft." -f $EnrollmentId)
+            return
+        }
+
+        Log-Warn ("Residual sweep: {0} remaining reference(s) to '{1}' under HKLM\SOFTWARE\Microsoft (logged, not deleted):" -f $hits.Count, $EnrollmentId)
+        foreach ($hit in $hits) {
+            Log-Warn ("    {0}" -f ([string]$hit).Trim())
+        }
+    } catch {
+        Log-Debug ("Residual sweep failed for '{0}': {1}" -f $EnrollmentId, $_.Exception.Message)
+    }
+}
+
+function Remove-MmpcDualEnrollmentTask {
+    # The dual-enrollment task (deviceenroller.exe /c /EnrollMmpc) self-deletes once MMPC
+    # enrollment succeeds. If it is still armed when migration runs, MMPC re-enrolls after our
+    # cleanup. Matched on action arguments because the task name varies by build.
+    $removed = 0
+
+    try {
+        $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+    } catch {
+        Log-Debug ("Failed to enumerate scheduled tasks: {0}" -f $_.Exception.Message)
+        return 0
+    }
+
+    foreach ($task in $tasks) {
+        if ($null -eq $task.Actions) { continue }
+
+        $isMatch = $false
+        try {
+            foreach ($action in @($task.Actions)) {
+                if ($null -eq $action) { continue }
+
+                $execute = ""
+                $arguments = ""
+                if ($action.PSObject.Properties.Match("Execute").Count -gt 0 -and $action.Execute) {
+                    $execute = [string]$action.Execute
+                }
+                if ($action.PSObject.Properties.Match("Arguments").Count -gt 0 -and $action.Arguments) {
+                    $arguments = [string]$action.Arguments
+                }
+
+                if (("{0} {1}" -f $execute, $arguments) -imatch 'EnrollMmpc') {
+                    $isMatch = $true
+                    break
+                }
+            }
+        } catch {
+            continue
+        }
+
+        if (-not $isMatch) { continue }
+
+        $fullTaskPath = "{0}{1}" -f $task.TaskPath, $task.TaskName
+        try {
+            Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction Stop
+            Log-Info ("Removed MMPC dual-enrollment task '{0}' to stop it re-enrolling during migration." -f $fullTaskPath)
+            $removed++
+        } catch {
+            Log-Warn ("Failed to remove MMPC dual-enrollment task '{0}': {1}" -f $fullTaskPath, $_.Exception.Message)
+        }
+    }
+
+    if ($removed -eq 0) {
+        Log-Debug "No MMPC dual-enrollment task present."
+    }
+
+    return $removed
+}
+
+function Get-DmClientBridgeClasses {
+    $found = @()
+
+    try {
+        $classes = @(Get-CimClass -Namespace $script:MdmBridgeNamespace -ClassName "MDM_DMClient*" -ErrorAction SilentlyContinue)
+        foreach ($class in $classes) {
+            $found += [string]$class.CimClassName
+        }
+    } catch {
+        Log-Debug ("MDM WMI bridge probe failed: {0}" -f $_.Exception.Message)
+        return @()
+    }
+
+    if ($found.Count -eq 0) {
+        Log-Debug "MDM WMI bridge exposes no MDM_DMClient* classes (Microsoft documents none)."
+    } else {
+        Log-Info ("MDM WMI bridge exposes {0} MDM_DMClient* class(es): {1}" -f $found.Count, ($found -join ", "))
+    }
+
+    return $found
+}
+
+function Invoke-LinkedEnrollmentUnenrollViaBridge {
+    # LinkedEnrollment/Unenroll is documented only as an OMA-DM Exec node, and Microsoft's MDM
+    # bridge reference documents no DMClient classes at all. This is a best-effort attempt that
+    # no-ops when the class is absent, and it logs the answer either way.
+    $linkedClasses = @(Get-DmClientBridgeClasses | Where-Object { $_ -imatch 'LinkedEnrollment' })
+    if ($linkedClasses.Count -eq 0) {
+        return $false
+    }
+
+    if (-not (Test-IsSystemAccount)) {
+        Log-Warn "A LinkedEnrollment WMI bridge class exists, but the MDM bridge requires the SYSTEM account for device settings; skipping the CSP path."
+        return $false
+    }
+
+    foreach ($className in $linkedClasses) {
+        try {
+            $instances = @(Get-CimInstance -Namespace $script:MdmBridgeNamespace -ClassName $className -ErrorAction Stop)
+            foreach ($instance in $instances) {
+                if ($null -eq $instance) { continue }
+                Log-Info ("Invoking LinkedEnrollment Unenroll via WMI bridge class '{0}'." -f $className)
+                Set-CimInstance -InputObject $instance -Property @{ Unenroll = "" } -ErrorAction Stop
+                Log-Info "LinkedEnrollment Unenroll was accepted by the WMI bridge."
+                return $true
+            }
+        } catch {
+            Log-Warn ("LinkedEnrollment Unenroll via '{0}' failed: {1}" -f $className, $_.Exception.Message)
+        }
+    }
+
+    return $false
+}
+
+function Wait-ForEnrollmentRemoval {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [string]$PrimaryEnrollmentId,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $enrollmentPath = "HKLM:\{0}\{1}" -f $script:EnrollmentsRoot, $EnrollmentId
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastStatus = $null
+
+    Log-Info ("Waiting up to {0}s for Windows to tear down enrollment '{1}'..." -f $TimeoutSeconds, $EnrollmentId)
+
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-Path -LiteralPath $enrollmentPath)) {
+            Log-Info ("Enrollment '{0}' is gone from the registry." -f $EnrollmentId)
+            return $true
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($PrimaryEnrollmentId)) {
+            $status = Get-HklmKeyValue -SubKeyPath ("{0}\{1}\LinkedEnrollment" -f $script:EnrollmentsRoot, $PrimaryEnrollmentId) -ValueName "EnrollStatus"
+            if ($null -ne $status -and [string]$status -ne [string]$lastStatus) {
+                $lastStatus = $status
+                Log-Info ("LinkedEnrollment EnrollStatus = {0} ({1})." -f $status, (Get-EnrollStatusDescription -Status $status))
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    Log-Warn ("Enrollment '{0}' still present after {1}s; falling back to artifact cleanup." -f $EnrollmentId, $TimeoutSeconds)
+    return $false
+}
+
+function Remove-MmpcEnrollmentArtifacts {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [string]$PrimaryEnrollmentId
+    )
+
+    Log-Info ("Removing declared-configuration artifacts for MMPC enrollment '{0}'..." -f $EnrollmentId)
+
+    $removed = 0
+
+    # Keys named with the enrollment ID under known declared-configuration roots.
+    $idNamedKeys = @(
+        ("{0}\{1}" -f $script:DeclaredConfigConfigRoot, $EnrollmentId),
+        ("{0}\{1}" -f $script:DeclaredConfigResultsRoot, $EnrollmentId)
+    )
+
+    foreach ($path in $idNamedKeys) {
+        if (Remove-HklmKeyWithBackup -SubKeyPath $path -ScopeId $EnrollmentId -Label ("DeclaredConfiguration-{0}" -f $EnrollmentId) -Reason "declared-configuration enrollment state") {
+            $removed++
+        }
+    }
+
+    # Correlated by the EnrollmentId value inside each key, never by the key name.
+    foreach ($orchestratorKey in (Get-DmOrchestratorKeysForEnrollment -EnrollmentId $EnrollmentId)) {
+        $path = "{0}\{1}" -f $script:DmOrchestratorRoot, $orchestratorKey
+        if (Remove-HklmKeyWithBackup -SubKeyPath $path -ScopeId $orchestratorKey -Label ("DMOrchestrator-{0}" -f $orchestratorKey) -Reason ("EnrollmentId matches {0}" -f $EnrollmentId)) {
+            $removed++
+        }
+    }
+
+    # The LinkedEnrollment subkey lives under the PRIMARY enrollment, not the MMPC one.
+    if (-not [string]::IsNullOrWhiteSpace($PrimaryEnrollmentId)) {
+        $linkedPath = "{0}\{1}\LinkedEnrollment" -f $script:EnrollmentsRoot, $PrimaryEnrollmentId
+        if (Remove-HklmKeyWithBackup -SubKeyPath $linkedPath -ScopeId $PrimaryEnrollmentId -Label ("LinkedEnrollment-{0}" -f $PrimaryEnrollmentId) -Reason "link back to the MMPC enrollment") {
+            $removed++
+        }
+    }
+
+    # Dangling values whose parent keys must survive. CurrentEnrollmentId is handled generically by
+    # Remove-DanglingEnrollmentValues instead, because it tracks whichever enrollment last ran a DM
+    # session - usually the primary, not the MMPC one.
+    $danglingValues = @(
+        @{ Path = $script:DeclaredConfigConfigRoot; Name = "_Container_EnrollmentId" }
+    )
+
+    foreach ($entry in $danglingValues) {
+        $current = Get-HklmKeyValue -SubKeyPath $entry.Path -ValueName $entry.Name
+        if ($null -eq $current) { continue }
+
+        if (([string]$current).Trim() -ine $EnrollmentId) {
+            Log-Debug ("Leaving '{0}\{1}' alone - it points at '{2}', not the MMPC enrollment." -f $entry.Path, $entry.Name, $current)
+            continue
+        }
+
+        if (Remove-HklmValueWithBackup -SubKeyPath $entry.Path -ValueName $entry.Name -Label ("Value-{0}" -f $entry.Name) -Reason "points at the MMPC enrollment") {
+            $removed++
+        }
+    }
+
+    Log-Info ("Declared-configuration cleanup for '{0}' removed {1} item(s)." -f $EnrollmentId, $removed)
+    return $removed
+}
+
+function Remove-DanglingEnrollmentValues {
+    # Shared single-value pointers that hold a bare enrollment ID rather than living under an
+    # enrollment-scoped key. Cleared only when they still point at the enrollment being removed, so
+    # a pointer belonging to another enrollment is never disturbed. Runs for every enrollment, not
+    # just MMPC ones.
+    param([Parameter(Mandatory=$true)][string]$EnrollmentId)
+
+    $removed = 0
+
+    $pointers = @(
+        @{ Path = $script:OmadmLoggerRoot; Name = "CurrentEnrollmentId" }
+    )
+
+    foreach ($entry in $pointers) {
+        $current = Get-HklmKeyValue -SubKeyPath $entry.Path -ValueName $entry.Name
+        if ($null -eq $current) { continue }
+
+        if (([string]$current).Trim() -ine $EnrollmentId) {
+            Log-Debug ("Leaving '{0}\{1}' alone - it points at '{2}', not '{3}'." -f $entry.Path, $entry.Name, $current, $EnrollmentId)
+            continue
+        }
+
+        if (Remove-HklmValueWithBackup -SubKeyPath $entry.Path -ValueName $entry.Name -Label ("Value-{0}" -f $entry.Name) -Reason ("points at removed enrollment {0}" -f $EnrollmentId)) {
+            $removed++
+        }
+    }
+
+    return $removed
+}
+
+function Remove-ResidualTaskCacheEntries {
+    param([Parameter(Mandatory=$true)][string]$EnrollmentId)
+
+    $treePath = "{0}\{1}" -f $script:TaskCacheTreeEnterprise, $EnrollmentId
+    $folderPrefix = "{0}\{1}\" -f $script:EnterpriseMgmtTaskPath, $EnrollmentId
+    $removed = 0
+
+    if (-not (Test-Path -LiteralPath ("HKLM:\{0}" -f $treePath))) {
+        Log-Debug ("No residual TaskCache tree for enrollment '{0}'." -f $EnrollmentId)
+        return 0
+    }
+
+    Log-Debug ("Scheduled task removal left a TaskCache tree behind for '{0}'; attempting cleanup." -f $EnrollmentId)
+
+    # Task definitions are keyed by their own GUID. Correlate on the Path value, never the name.
+    foreach ($taskGuid in (Get-HklmSubKeyNames -SubKeyPath $script:TaskCacheTasksRoot)) {
+        $taskKeyPath = "{0}\{1}" -f $script:TaskCacheTasksRoot, $taskGuid
+        $path = Get-HklmKeyValue -SubKeyPath $taskKeyPath -ValueName "Path"
+        if ($null -eq $path) { continue }
+        if (-not ([string]$path).StartsWith($folderPrefix, [System.StringComparison]::InvariantCultureIgnoreCase)) { continue }
+
+        if (Remove-HklmKeyWithBackup -SubKeyPath $taskKeyPath -ScopeId $taskGuid -Label ("TaskCache-Task-{0}" -f $taskGuid) -Reason ("task under {0}" -f $folderPrefix)) {
+            $removed++
+        }
+    }
+
+    if (Remove-HklmKeyWithBackup -SubKeyPath $treePath -ScopeId $EnrollmentId -Label ("TaskCache-Tree-{0}" -f $EnrollmentId) -Reason "orphaned EnterpriseMgmt task folder") {
+        $removed++
+    } elseif (-not (Test-IsSystemAccount)) {
+        # TaskCache is ACL'd to SYSTEM/TrustedInstaller; an elevated admin still gets
+        # "Requested registry access is not allowed". The tasks themselves are already unregistered,
+        # and Task Scheduler ignores a Tree entry with no backing task, so this is cosmetic. The
+        # agent runs this as SYSTEM in production, where the delete succeeds.
+        Log-Info ("Could not remove the TaskCache tree for '{0}': this session is not SYSTEM and TaskCache is ACL-protected. Cosmetic only - the scheduled tasks are already gone." -f $EnrollmentId)
+    }
+
+    return $removed
+}
+
+function Remove-EnrollmentCertificate {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [string]$Thumbprint,
+        [string[]]$ProtectedThumbprints
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+        # SslClientCertSearchCriteria is a search string, not an identifier. It can resolve to
+        # zero or several certificates, and these private keys are TPM-backed and unrecoverable,
+        # so an ambiguous match is only ever reported.
+        $criteria = Get-HklmKeyValue -SubKeyPath ("{0}\{1}" -f $script:OmadmAccountsRoot, $EnrollmentId) -ValueName "SslClientCertSearchCriteria"
+        if ($null -eq $criteria) {
+            $criteria = Get-HklmKeyValue -SubKeyPath ("{0}\{1}\Protected" -f $script:OmadmAccountsRoot, $EnrollmentId) -ValueName "SslClientCertSearchCriteria"
+        }
+
+        if ($null -ne $criteria) {
+            Log-Warn ("Enrollment '{0}' has no DMPCertThumbprint, only search criteria '{1}'. Leaving certificates untouched." -f $EnrollmentId, $criteria)
+        } else {
+            Log-Debug ("No certificate reference recorded for enrollment '{0}'." -f $EnrollmentId)
+        }
+        return $false
+    }
+
+    $normalized = ($Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $false
+    }
+
+    foreach ($protected in @($ProtectedThumbprints)) {
+        if ([string]::IsNullOrWhiteSpace($protected)) { continue }
+        if ((($protected -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()) -eq $normalized) {
+            Log-Warn ("Certificate {0} is also referenced by another enrollment; leaving it in place." -f $normalized)
+            return $false
+        }
+    }
+
+    try {
+        $certs = @(Get-ChildItem -Path "Cert:\LocalMachine\My" -ErrorAction Stop | Where-Object { $_.Thumbprint -eq $normalized })
+    } catch {
+        Log-Warn ("Failed to enumerate Cert:\LocalMachine\My: {0}" -f $_.Exception.Message)
+        return $false
+    }
+
+    if ($certs.Count -eq 0) {
+        Log-Debug ("Certificate {0} for enrollment '{1}' is already gone from LocalMachine\My." -f $normalized, $EnrollmentId)
+        return $false
+    }
+
+    if ($certs.Count -gt 1) {
+        Log-Warn ("Thumbprint {0} matched {1} certificates; leaving them in place." -f $normalized, $certs.Count)
+        return $false
+    }
+
+    $cert = $certs[0]
+    Log-Info ("Removing certificate {0} (Subject '{1}') for enrollment '{2}'." -f $cert.Thumbprint, $cert.Subject, $EnrollmentId)
+
+    try {
+        Remove-Item -LiteralPath $cert.PSPath -Force -DeleteKey -ErrorAction Stop
+        Log-Info ("Removed certificate {0} and its private key container." -f $normalized)
+        return $true
+    } catch {
+        Log-Debug ("Remove-Item -DeleteKey failed for {0} ({1}); retrying without it." -f $normalized, $_.Exception.Message)
+    }
+
+    try {
+        Remove-Item -LiteralPath $cert.PSPath -Force -ErrorAction Stop
+        Log-Info ("Removed certificate {0} (private key container left in place)." -f $normalized)
+        return $true
+    } catch {
+        Log-Warn ("Failed to remove certificate {0}: {1}" -f $normalized, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Clear-MmpcResidualState {
+    # Runs regardless of whether an MMPC enrollment was found. Residual declared-configuration
+    # state is what makes Windows attempt a WinDC (JSON) discovery against the new MDM instead
+    # of the MS-MDE2 XML discovery it expects. No-ops on devices that were never MMPC enrolled.
+    Log-Info "Clearing residual MMPC / declared-configuration state before registration..."
+
+    $cleared = 0
+
+    # A non-zero flag makes Windows consider the device still MDM enrolled and blocks new
+    # enrollment by any method. Reset to 0 rather than deleting the value: 0 is a known-good live
+    # state (observed on a device that was actively MMPC enrolled) and is what other vendors'
+    # migration tooling does, whereas an absent value is untested. The flag's exact semantics are
+    # undocumented, so match on the name rather than assuming a single spelling.
+    foreach ($valueName in (Get-HklmValueNames -SubKeyPath $script:EnrollmentsRoot)) {
+        if ($valueName -inotmatch 'mmpc') { continue }
+
+        $current = Get-HklmKeyValue -SubKeyPath $script:EnrollmentsRoot -ValueName $valueName
+        Log-Info ("Found MMPC flag '{0}' = '{1}' at the Enrollments root." -f $valueName, $current)
+
+        if ((Get-MmpcFlagValueAsInt -RawValue $current) -eq 0) {
+            Log-Info ("MMPC flag '{0}' is already 0; leaving it as-is." -f $valueName)
+            continue
+        }
+
+        if (Set-HklmDwordWithBackup -SubKeyPath $script:EnrollmentsRoot -ValueName $valueName -Value 0 -Label "Enrollments-Root" -Reason "non-zero MMPC flag blocks new MDM enrollment") {
+            $cleared++
+        }
+    }
+
+    # Any surviving LinkedEnrollment key still advertises a link, and its DiscoveryEndpoint is
+    # the documented switch that sends Windows down the JSON discovery path.
+    foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $script:EnrollmentsRoot)) {
+        if ($name -ieq "Status") { continue }
+
+        $linkedPath = "{0}\{1}\LinkedEnrollment" -f $script:EnrollmentsRoot, $name
+        if (-not (Test-Path -LiteralPath ("HKLM:\{0}" -f $linkedPath))) { continue }
+
+        Log-Warn ("Residual LinkedEnrollment key found under enrollment '{0}'; removing it." -f $name)
+        if (Remove-HklmKeyWithBackup -SubKeyPath $linkedPath -ScopeId $name -Label ("Residual-LinkedEnrollment-{0}" -f $name) -Reason "residual declared-configuration link") {
+            $cleared++
+        }
+    }
+
+    if ($cleared -eq 0) {
+        Log-Info "No residual MMPC state found."
+    } else {
+        Log-Info ("Residual MMPC state cleanup removed {0} item(s)." -f $cleared)
+    }
+
+    return $cleared
+}
+
+function Test-EnrollmentCleanSlate {
+    # Findings are split by whether they actually prevent a new enrollment. A surviving foreign
+    # primary enrollment and a non-zero MMPC flag both make Windows reject registration outright,
+    # so they abort the run. Leftover declared-configuration keys and scheduled tasks are residue
+    # that Windows routinely tolerates - they are reported, but blocking on them would fail
+    # devices that would have migrated cleanly.
+    Log-Info "Verifying the device is in a clean state before registering..."
+
+    $blocking = @()
+    $cosmetic = @()
+
+    # Re-run the same discovery the migration used rather than re-implementing the filters here.
+    # Windows keeps permanent pseudo-enrollments - "Local Authority", "Cloud Authority",
+    # "Deploy Authority", and WMI-bridge providers with no device certificate - that exist on every
+    # device, are never migration targets, and must not block registration. Calling
+    # Get-EnrollmentCandidates means the gate and candidate selection cannot disagree about what
+    # counts as a real enrollment.
+    foreach ($survivor in @(Get-EnrollmentCandidates)) {
+        if (Test-IsKandjiOrIruProviderId -ProviderId ([string]$survivor.ProviderId)) { continue }
+
+        $blocking += ("Enrollment '{0}' survived unenrollment with ProviderID '{1}'." -f $survivor.Id, $survivor.ProviderId)
+    }
+
+    # A zero flag is normal and coexists with a healthy enrollment; only a non-zero one blocks.
+    foreach ($valueName in (Get-HklmValueNames -SubKeyPath $script:EnrollmentsRoot)) {
+        if ($valueName -inotmatch 'mmpc') { continue }
+
+        $flagValue = Get-HklmKeyValue -SubKeyPath $script:EnrollmentsRoot -ValueName $valueName
+        if ((Get-MmpcFlagValueAsInt -RawValue $flagValue) -ne 0) {
+            $blocking += ("MMPC flag '{0}' is '{1}'; a non-zero value blocks new MDM enrollment." -f $valueName, $flagValue)
+        }
+    }
+
+    foreach ($root in @($script:DeclaredConfigConfigRoot, $script:DeclaredConfigResultsRoot)) {
+        foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $root)) {
+            $cosmetic += ("Declared-configuration enrollment '{0}' is still present under '{1}'." -f $name, $root)
+        }
+    }
+
+    try {
+        $residualTasks = @(Get-ScheduledTask -TaskPath ("{0}\*" -f $script:EnterpriseMgmtTaskPath) -ErrorAction SilentlyContinue)
+        if ($residualTasks.Count -gt 0) {
+            $cosmetic += ("{0} scheduled task(s) still present under {1}." -f $residualTasks.Count, $script:EnterpriseMgmtTaskPath)
+        }
+    } catch {
+        Log-Debug ("Could not enumerate EnterpriseMgmt tasks: {0}" -f $_.Exception.Message)
+    }
+
+    if ($cosmetic.Count -gt 0) {
+        Log-Warn ("Clean-slate check found {0} non-blocking residual item(s). Registration can still proceed:" -f $cosmetic.Count)
+        foreach ($item in $cosmetic) {
+            Log-Warn ("    {0}" -f $item)
+        }
+    }
+
+    if ($blocking.Count -gt 0) {
+        Log-Error ("Clean-slate check found {0} item(s) that will block registration:" -f $blocking.Count)
+        foreach ($item in $blocking) {
+            Log-Error ("    {0}" -f $item)
+        }
+    }
+
+    if ($blocking.Count -eq 0 -and $cosmetic.Count -eq 0) {
+        Log-Info "Clean-slate check passed: no residual MDM enrollment state found."
+    }
+
+    return [pscustomobject]@{
+        IsBlocked = ($blocking.Count -gt 0)
+        Blocking  = $blocking
+        Cosmetic  = $cosmetic
+    }
+}
+
+function Register-EnrollmentOutcome {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [string]$ProviderId,
+        [bool]$IsLinkedMmpc,
+        [string]$LinkedFrom,
+        [string]$CertThumbprint
+    )
+
+    $script:EnrollmentOutcomes[$EnrollmentId] = [pscustomobject]@{
+        Id             = $EnrollmentId
+        ProviderId     = if ([string]::IsNullOrWhiteSpace($ProviderId)) { "(none)" } else { $ProviderId }
+        IsLinkedMmpc   = $IsLinkedMmpc
+        LinkedFrom     = $LinkedFrom
+        CertThumbprint = $CertThumbprint
+        Bridge         = "not attempted"
+        Unenroll       = "not attempted"
+        Artifacts      = "not attempted"
+        Certificate    = "not attempted"
+    }
+}
+
+function Set-EnrollmentOutcome {
+    param(
+        [Parameter(Mandatory=$true)][string]$EnrollmentId,
+        [Parameter(Mandatory=$true)][ValidateSet("Bridge","Unenroll","Artifacts","Certificate")][string]$Field,
+        [Parameter(Mandatory=$true)][string]$Value
+    )
+
+    if (-not $script:EnrollmentOutcomes.Contains($EnrollmentId)) { return }
+    $script:EnrollmentOutcomes[$EnrollmentId].$Field = $Value
+}
+
+function Write-RunSummary {
+    param([int]$FinalExitCode)
+
+    Log-Info "================================================================"
+    Log-Info " Migration summary"
+    Log-Info "================================================================"
+
+    if ($script:EnrollmentOutcomes.Count -eq 0) {
+        Log-Info "Prior enrollments  : none found on this device"
+    } else {
+        Log-Info ("Prior enrollments  : {0} processed, linked MMPC first" -f $script:EnrollmentOutcomes.Count)
+
+        foreach ($key in @($script:EnrollmentOutcomes.Keys)) {
+            $outcome = $script:EnrollmentOutcomes[$key]
+            $kind = if ($outcome.IsLinkedMmpc) { "linked MMPC" } else { "primary MDM" }
+
+            Log-Info ""
+            Log-Info ("  {0}  [{1}]" -f $outcome.Id, $kind)
+            Log-Info ("    ProviderID         : {0}" -f $outcome.ProviderId)
+
+            if ($outcome.IsLinkedMmpc -and -not [string]::IsNullOrWhiteSpace($outcome.LinkedFrom)) {
+                Log-Info ("    Linked from        : {0}" -f $outcome.LinkedFrom)
+            }
+            if ($outcome.IsLinkedMmpc) {
+                Log-Info ("    LinkedEnrollment   : {0}" -f $outcome.Bridge)
+            }
+
+            Log-Info ("    Unenroll           : {0}" -f $outcome.Unenroll)
+            Log-Info ("    Artifact cleanup   : {0}" -f $outcome.Artifacts)
+            Log-Info ("    Certificate        : {0}" -f $outcome.Certificate)
+        }
+
+        Log-Info ""
+    }
+
+    Log-Info ("MMPC dual-enroll task : {0}" -f $script:SummaryMmpcTask)
+    Log-Info ("Residual MMPC state   : {0}" -f $script:SummaryMmpcFlag)
+    Log-Info ("Clean-slate check     : {0}" -f $script:SummaryCleanSlate)
+    Log-Info ("Registration          : {0}" -f $script:SummaryRegistration)
+
+    if (-not [string]::IsNullOrWhiteSpace($script:BackupDir)) {
+        Log-Info ("Registry backups      : {0}" -f $script:BackupDir)
+    } else {
+        Log-Info "Registry backups      : none written (nothing was deleted)"
+    }
+
+    Log-Info ("Exit code             : {0}" -f $FinalExitCode)
+    Log-Info "================================================================"
+}
+
+function Invoke-MdmDiagnostics {
+    Log-Info "================================================================"
+    Log-Info " MDM enrollment diagnostics - read-only, nothing will be changed"
+    Log-Info "================================================================"
+    Log-Info ("Running as SYSTEM: {0}" -f (Test-IsSystemAccount))
+
+    Log-Info "--- Enrollments (raw) ---"
+    foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $script:EnrollmentsRoot)) {
+        if ($name -ieq "Status") { continue }
+
+        $keyPath = "{0}\{1}" -f $script:EnrollmentsRoot, $name
+        Log-Info ("  {0}" -f $name)
+        foreach ($valueName in (Get-HklmValueNames -SubKeyPath $keyPath)) {
+            Log-Info ("      {0,-28} = {1}" -f $valueName, (Get-HklmKeyValue -SubKeyPath $keyPath -ValueName $valueName))
+        }
+
+        $linkedPath = "{0}\LinkedEnrollment" -f $keyPath
+        foreach ($valueName in (Get-HklmValueNames -SubKeyPath $linkedPath)) {
+            Log-Info ("      LinkedEnrollment\{0,-11} = {1}" -f $valueName, (Get-HklmKeyValue -SubKeyPath $linkedPath -ValueName $valueName))
+        }
+    }
+
+    Log-Info "--- Enrollments root values ---"
+    $rootValues = @(Get-HklmValueNames -SubKeyPath $script:EnrollmentsRoot)
+    if ($rootValues.Count -eq 0) {
+        Log-Info "  (none)"
+    }
+    foreach ($valueName in $rootValues) {
+        Log-Info ("  {0,-28} = {1}" -f $valueName, (Get-HklmKeyValue -SubKeyPath $script:EnrollmentsRoot -ValueName $valueName))
+    }
+
+    Log-Info "--- Enrollment candidates after filtering ---"
+    $candidates = @(Get-EnrollmentCandidates)
+    Log-Info ("  Count: {0}" -f $candidates.Count)
+    foreach ($candidate in $candidates) {
+        Log-Info ("  Id={0}" -f $candidate.Id)
+        Log-Info ("      ProviderID        = {0}" -f $candidate.ProviderId)
+        Log-Info ("      UPN               = {0}" -f $candidate.Upn)
+        Log-Info ("      EnrollmentType    = {0}" -f $candidate.EnrollmentType)
+        Log-Info ("      DiscoveryUrl      = {0}" -f $candidate.DiscoveryUrl)
+        Log-Info ("      DMPCertThumbprint = {0}" -f $candidate.DmpCertThumbprint)
+        Log-Info ("      IsLinkedMmpc      = {0}" -f $candidate.IsLinkedMmpc)
+        Log-Info ("      LinkedFrom        = {0}" -f $candidate.LinkedFrom)
+        Write-ArtifactMapLog -Map (Get-EnrollmentArtifactMap -EnrollmentId $candidate.Id -PrimaryEnrollmentId $candidate.LinkedFrom) -Context "current"
+    }
+
+    Log-Info "--- Declared configuration ---"
+    foreach ($root in @($script:DeclaredConfigConfigRoot, $script:DeclaredConfigResultsRoot)) {
+        $names = @(Get-HklmSubKeyNames -SubKeyPath $root)
+        Log-Info ("  {0}: {1} enrollment(s) [{2}]" -f $root, $names.Count, ($names -join ", "))
+    }
+
+    Log-Info "--- DMOrchestrator ---"
+    foreach ($name in (Get-HklmSubKeyNames -SubKeyPath $script:DmOrchestratorRoot)) {
+        $enrollmentId = Get-HklmKeyValue -SubKeyPath ("{0}\{1}" -f $script:DmOrchestratorRoot, $name) -ValueName "EnrollmentId"
+        Log-Info ("  {0} -> EnrollmentId = {1}" -f $name, $enrollmentId)
+    }
+
+    Log-Info "--- EnterpriseMgmt scheduled tasks ---"
+    try {
+        $tasks = @(Get-ScheduledTask -TaskPath ("{0}\*" -f $script:EnterpriseMgmtTaskPath) -ErrorAction SilentlyContinue)
+        Log-Info ("  Count: {0}" -f $tasks.Count)
+        foreach ($task in $tasks) {
+            Log-Info ("  {0}{1}  [{2}]" -f $task.TaskPath, $task.TaskName, $task.State)
+        }
+    } catch {
+        Log-Warn ("  Failed to enumerate tasks: {0}" -f $_.Exception.Message)
+    }
+
+    Log-Info "--- LocalMachine\My certificates ---"
+    try {
+        foreach ($cert in @(Get-ChildItem -Path "Cert:\LocalMachine\My" -ErrorAction Stop)) {
+            Log-Info ("  {0}  NotAfter={1}  Subject={2}" -f $cert.Thumbprint, $cert.NotAfter, $cert.Subject)
+        }
+    } catch {
+        Log-Warn ("  Failed to enumerate certificates: {0}" -f $_.Exception.Message)
+    }
+
+    Log-Info "--- MDM WMI bridge DMClient probe ---"
+    $null = Get-DmClientBridgeClasses
+
+    Log-Info "--- DeviceManagement event log (last 30 minutes) ---"
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin'
+            StartTime = (Get-Date).AddMinutes(-30)
+        } -ErrorAction SilentlyContinue)
+
+        Log-Info ("  Count: {0}" -f $events.Count)
+        foreach ($logEvent in $events) {
+            Log-Info ("  {0} [{1}] Id={2} {3}" -f $logEvent.TimeCreated, $logEvent.LevelDisplayName, $logEvent.Id, ($logEvent.Message -replace '\s+', ' '))
+        }
+    } catch {
+        Log-Warn ("  Failed to read the event log: {0}" -f $_.Exception.Message)
+    }
+
+    Log-Info "================================================================"
+    Log-Info " End of diagnostics"
+    Log-Info "================================================================"
+}
+
 function Remove-EnrollmentScheduledTasks {
     param(
         [Parameter(Mandatory=$true)]
@@ -1130,9 +2342,26 @@ function Remove-EnrollmentScheduledTasks {
             $taskName = $task.TaskName
             $taskPathValue = $task.TaskPath
             $fullTaskPath = $taskPathValue + $taskName
-            
+
             # Check if task name or path contains the enrollment ID
-            if ($taskName -like "*$EnrollmentId*" -or $taskPathValue -like "*$EnrollmentId*" -or $fullTaskPath -like "*$EnrollmentId*") {
+            $isMatch = ($taskName -like "*$EnrollmentId*" -or $taskPathValue -like "*$EnrollmentId*" -or $fullTaskPath -like "*$EnrollmentId*")
+
+            # The declared-configuration refresh task has relocated between Windows builds and
+            # may sit at the EnterpriseMgmt root rather than inside the enrollment's own folder,
+            # so also match the enrollment ID inside the task definition XML.
+            if (-not $isMatch) {
+                try {
+                    $taskXml = Export-ScheduledTask -TaskName $taskName -TaskPath $taskPathValue -ErrorAction Stop
+                    if ($taskXml -and ([string]$taskXml) -imatch [regex]::Escape($EnrollmentId)) {
+                        $isMatch = $true
+                        Log-Debug ("Task '{0}' matched enrollment ID inside its definition XML." -f $fullTaskPath)
+                    }
+                } catch {
+                    Log-Debug ("Could not export task '{0}' for XML matching: {1}" -f $fullTaskPath, $_.Exception.Message)
+                }
+            }
+
+            if ($isMatch) {
                 try {
                     Log-Debug ("Removing scheduled task: {0}" -f $fullTaskPath)
                     Unregister-ScheduledTask -TaskName $taskName -TaskPath $taskPathValue -Confirm:$false -ErrorAction Stop
@@ -1146,10 +2375,49 @@ function Remove-EnrollmentScheduledTasks {
 
         Log-Info ("Removed {0} scheduled task(s) for enrollment ID '{1}'." -f $removedCount, $EnrollmentId)
 
+        # Task Scheduler leaves the now-empty GUID directory behind on disk. This is the one
+        # artifact a registry sweep cannot surface, since it is a filesystem path rather than a key.
+        $null = Remove-EnrollmentTaskFolder -EnrollmentId $EnrollmentId
+
         return $removedCount
     } catch {
         Log-Warn ("Error checking for scheduled tasks: {0}" -f $_.Exception.Message)
         return 0
+    }
+}
+
+function Remove-EnrollmentTaskFolder {
+    param([Parameter(Mandatory=$true)][string]$EnrollmentId)
+
+    # Guard against a blank ID collapsing the path onto the shared EnterpriseMgmt directory, which
+    # holds every enrollment's tasks.
+    if ($EnrollmentId -notmatch '^[A-Fa-f0-9]{8}-([A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}$') {
+        Log-Warn ("Refusing to remove a task folder for '{0}': not a well-formed enrollment GUID." -f $EnrollmentId)
+        return $false
+    }
+
+    $folder = Join-Path $env:SystemRoot ("System32\Tasks\Microsoft\Windows\EnterpriseMgmt\{0}" -f $EnrollmentId)
+
+    try {
+        if (-not (Test-Path -LiteralPath $folder)) {
+            Log-Debug ("No on-disk task folder at '{0}'." -f $folder)
+            return $false
+        }
+
+        # Only remove it once Task Scheduler has no registered tasks left inside, so a folder that
+        # still backs a live task is never touched.
+        $remaining = @(Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue)
+        if ($remaining.Count -gt 0) {
+            Log-Warn ("Task folder '{0}' still contains {1} task definition file(s); leaving it in place." -f $folder, $remaining.Count)
+            return $false
+        }
+
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+        Log-Info ("Removed empty on-disk task folder '{0}'." -f $folder)
+        return $true
+    } catch {
+        Log-Warn ("Failed to remove on-disk task folder '{0}': {1}" -f $folder, $_.Exception.Message)
+        return $false
     }
 }
 
@@ -1160,35 +2428,46 @@ function Remove-EnrollmentRegistryKeys {
     )
 
     Log-Debug ("Starting registry cleanup for enrollment ID '{0}'..." -f $EnrollmentId)
-    
+
+    # Paths are relative to HKLM. Ordering matters: the Enrollments key itself goes last so the
+    # earlier steps can still read from it.
     $regPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Enrollments\Status\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\EnterpriseResourceManager\Tracked\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\PolicyManager\AdmxInstalled\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\PolicyManager\Providers\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Logger\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Sessions\$EnrollmentId",
-        "HKLM:\SOFTWARE\Microsoft\Enrollments\$EnrollmentId"
+        "SOFTWARE\Microsoft\Enrollments\Status\$EnrollmentId",
+        "SOFTWARE\Microsoft\Enrollments\Context\$EnrollmentId",
+        "SOFTWARE\Microsoft\EnterpriseResourceManager\Tracked\$EnrollmentId",
+        "SOFTWARE\Microsoft\PolicyManager\AdmxInstalled\$EnrollmentId",
+        "SOFTWARE\Microsoft\PolicyManager\Providers\$EnrollmentId",
+        "SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\$EnrollmentId",
+        "SOFTWARE\Microsoft\Provisioning\OMADM\Logger\$EnrollmentId",
+        "SOFTWARE\Microsoft\Provisioning\OMADM\Sessions\$EnrollmentId",
+        "SOFTWARE\Microsoft\Enrollments\$EnrollmentId"
     )
+
+    # EnterpriseResourceManager\Tracked is flat on some builds and nested by user SID on others.
+    foreach ($trackedChild in (Get-HklmSubKeyNames -SubKeyPath $script:TrackedRoot)) {
+        if ($trackedChild -ieq $EnrollmentId) { continue }
+
+        $nestedPath = "{0}\{1}\{2}" -f $script:TrackedRoot, $trackedChild, $EnrollmentId
+        if (Test-Path -LiteralPath ("HKLM:\{0}" -f $nestedPath)) {
+            Log-Debug ("Found SID-nested tracked entry: {0}" -f $nestedPath)
+            $regPaths += $nestedPath
+        }
+    }
 
     $removedCount = 0
     $skippedCount = 0
     $failedCount = 0
 
     foreach ($regPath in $regPaths) {
-        try {
-            if (Test-Path -Path $regPath) {
-                Log-Debug ("Removing registry key: {0}" -f $regPath)
-                Remove-Item -Path $regPath -Recurse -Force -ErrorAction Stop
-                Log-Info ("Successfully removed registry key: {0}" -f $regPath)
-                $removedCount++
-            } else {
-                Log-Debug ("Registry key does not exist (skipping): {0}" -f $regPath)
-                $skippedCount++
-            }
-        } catch {
-            Log-Warn ("Failed to remove registry key '{0}': {1}" -f $regPath, $_.Exception.Message)
+        if (-not (Test-Path -LiteralPath ("HKLM:\{0}" -f $regPath))) {
+            Log-Debug ("Registry key does not exist (skipping): HKLM:\{0}" -f $regPath)
+            $skippedCount++
+            continue
+        }
+
+        if (Remove-HklmKeyWithBackup -SubKeyPath $regPath -ScopeId $EnrollmentId -Label ("Enrollment-{0}-{1}" -f $EnrollmentId, ($regPath -replace '.*\\([^\\]+\\[^\\]+)$', '$1'))) {
+            $removedCount++
+        } else {
             $failedCount++
         }
     }
@@ -1205,24 +2484,60 @@ function Remove-EnrollmentRegistryKeys {
 function Remove-EnrollmentArtifacts {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$EnrollmentId
+        [string]$EnrollmentId,
+        [string]$PrimaryEnrollmentId,
+        [switch]$IsLinkedMmpc,
+        [string]$CertificateThumbprint,
+        [string[]]$ProtectedThumbprints
     )
 
     Log-Info ("Starting cleanup of enrollment artifacts for ID '{0}'..." -f $EnrollmentId)
 
+    $before = Get-EnrollmentArtifactMap -EnrollmentId $EnrollmentId -PrimaryEnrollmentId $PrimaryEnrollmentId
+    Write-ArtifactMapLog -Map $before -Context "before cleanup"
+
     # Remove scheduled tasks
     $taskCount = Remove-EnrollmentScheduledTasks -EnrollmentId $EnrollmentId
+
+    # Declared-configuration artifacts must go before the Enrollments key is removed, because
+    # the LinkedEnrollment cross-reference lives under the primary enrollment.
+    $mmpcRemoved = 0
+    if ($IsLinkedMmpc.IsPresent) {
+        $mmpcRemoved = Remove-MmpcEnrollmentArtifacts -EnrollmentId $EnrollmentId -PrimaryEnrollmentId $PrimaryEnrollmentId
+    }
 
     # Remove registry keys
     $regResult = Remove-EnrollmentRegistryKeys -EnrollmentId $EnrollmentId
 
-    Log-Info ("Cleanup complete for enrollment ID '{0}': {1} scheduled task(s) removed, {2} registry key(s) removed." -f $EnrollmentId, $taskCount, $regResult.Removed)
+    # Task Scheduler normally clears its own backing store; this only fires on residue.
+    $taskCacheRemoved = Remove-ResidualTaskCacheEntries -EnrollmentId $EnrollmentId
+
+    # Shared pointers that named this enrollment, cleared for primary and MMPC alike.
+    $taskCacheRemoved += Remove-DanglingEnrollmentValues -EnrollmentId $EnrollmentId
+
+    # Certificate removal runs last: the DM client needs the certificate to authenticate while
+    # the unenrollment is still in flight.
+    $certRemoved = Remove-EnrollmentCertificate -EnrollmentId $EnrollmentId -Thumbprint $CertificateThumbprint -ProtectedThumbprints $ProtectedThumbprints
+
+    $after = Get-EnrollmentArtifactMap -EnrollmentId $EnrollmentId -PrimaryEnrollmentId $PrimaryEnrollmentId
+    Write-ArtifactMapLog -Map $after -Context "after cleanup"
+
+    # Runs for every enrollment, not just linked MMPC ones. The known-path list was derived from a
+    # single device's MMPC enrollment, so a primary enrollment on another build may leave artifacts
+    # nobody has enumerated yet. This only logs - it never deletes - so it reports what we missed
+    # per device instead of guessing at paths in advance.
+    Write-ResidualGuidSweep -EnrollmentId $EnrollmentId
+
+    Log-Info ("Cleanup complete for enrollment ID '{0}': {1} scheduled task(s), {2} registry key(s), {3} declared-configuration item(s), {4} TaskCache entr(ies) removed; certificate removed = {5}." -f $EnrollmentId, $taskCount, $regResult.Removed, $mmpcRemoved, $taskCacheRemoved, $certRemoved)
 
     return @{
         TasksRemoved = $taskCount
         RegistryKeysRemoved = $regResult.Removed
         RegistryKeysSkipped = $regResult.Skipped
         RegistryKeysFailed = $regResult.Failed
+        MmpcItemsRemoved = $mmpcRemoved
+        TaskCacheEntriesRemoved = $taskCacheRemoved
+        CertificateRemoved = $certRemoved
     }
 }
 
@@ -1320,17 +2635,31 @@ function Invoke-ApplicationUninstalls {
 }
 
 function Test-IsKandjiOrIruProviderId {
+    # Matches both names so the check keeps working through a rename, and matches either as a
+    # prefix ("Iru", "Iru MDM", "IruEndpoint") without matching a substring buried inside an
+    # unrelated word. A plain Contains('iru') matches "antivirus", which would cause a foreign
+    # provider to be mistaken for ours and skipped instead of migrated.
     param([string]$ProviderId)
+
     if ([string]::IsNullOrWhiteSpace($ProviderId)) {
         return $false
     }
-    $p = $ProviderId.ToLowerInvariant()
-    return $p.Contains('kandji') -or $p.Contains('iru')
+
+    return ($ProviderId.ToLowerInvariant() -match '(^|[^a-z0-9])(kandji|iru)')
 }
 
 function Get-EnrollmentCandidates {
     $list = @()
     $root = $null
+
+    # Authoritative MMPC identification. Empty on devices that were never MMPC enrolled, in
+    # which case classification falls back to the value heuristics below.
+    $linkedMap = @{}
+    try {
+        $linkedMap = Get-LinkedEnrollmentMap
+    } catch {
+        Log-Debug ("Failed to build the linked enrollment map: {0}" -f $_.Exception.Message)
+    }
 
     try {
         $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
@@ -1355,15 +2684,34 @@ function Get-EnrollmentCandidates {
         try {
             $provider = $sub.GetValue("ProviderID", $null)
             $upn = $sub.GetValue("UPN", "")
+            $discoveryUrl = [string]$sub.GetValue("DiscoveryServiceFullURL", "")
+            $enrollmentType = [string]$sub.GetValue("EnrollmentType", "")
+            $aadResourceId = [string]$sub.GetValue("AADResourceID", "")
+            $dmpCertThumbprint = [string]$sub.GetValue("DMPCertThumbprint", "")
+
+            $linkedFrom = $null
+            if ($linkedMap.ContainsKey($name)) {
+                $linkedFrom = [string]$linkedMap[$name]
+            }
+
+            $isLinkedMmpc = $false
+            if (-not [string]::IsNullOrWhiteSpace($linkedFrom)) {
+                $isLinkedMmpc = $true
+            } elseif (Test-IsMmpcEnrollmentValues -ProviderId ([string]$provider) -DiscoveryUrl $discoveryUrl -EnrollmentType $enrollmentType -AadResourceId $aadResourceId) {
+                $isLinkedMmpc = $true
+            }
 
             if ([string]::IsNullOrEmpty($provider)) {
-                Log-Debug ("Skipping {0} (no ProviderID)." -f $name)
-                continue
+                if (-not $isLinkedMmpc) {
+                    Log-Debug ("Skipping {0} (no ProviderID)." -f $name)
+                    continue
+                }
+                Log-Debug ("Enrollment {0} has no ProviderID but is identified as the linked MMPC enrollment; retaining it." -f $name)
             }
 
             $skip = $false
             foreach ($item in $exclude) {
-                if ($item.Equals($provider, [System.StringComparison]::InvariantCultureIgnoreCase)) {
+                if ($item.Equals([string]$provider, [System.StringComparison]::InvariantCultureIgnoreCase)) {
                     $skip = $true
                     break
                 }
@@ -1374,17 +2722,26 @@ function Get-EnrollmentCandidates {
                 continue
             }
 
-            # Secondary check: verify DMPCertThumbprint exists and isn't empty
-            $dmpCertThumbprint = $sub.GetValue("DMPCertThumbprint", $null)
+            # Secondary check: verify DMPCertThumbprint exists and isn't empty. The linked MMPC
+            # enrollment is exempt - it has to be torn down even without a certificate reference,
+            # otherwise declared-configuration state survives the migration.
             if ([string]::IsNullOrEmpty($dmpCertThumbprint)) {
-                Log-Debug ("Skipping {0} (DMPCertThumbprint is missing or empty)." -f $name)
-                continue
+                if (-not $isLinkedMmpc) {
+                    Log-Debug ("Skipping {0} (DMPCertThumbprint is missing or empty)." -f $name)
+                    continue
+                }
+                Log-Debug ("Linked MMPC enrollment {0} has no DMPCertThumbprint; retaining it for teardown." -f $name)
             }
 
             $list += [pscustomobject]@{
-                Id         = $name
-                ProviderId = $provider
-                Upn        = $upn
+                Id                = $name
+                ProviderId        = [string]$provider
+                Upn               = $upn
+                DiscoveryUrl      = $discoveryUrl
+                EnrollmentType    = $enrollmentType
+                DmpCertThumbprint = $dmpCertThumbprint
+                IsLinkedMmpc      = $isLinkedMmpc
+                LinkedFrom        = $linkedFrom
             }
         } finally {
             $sub.Close()
@@ -1727,6 +3084,19 @@ $script:DebugMode = $Debug.IsPresent -or $EnableDebugDefault
 $silentMode = $Silent.IsPresent -or $EnableSilentDefault
 $forceRemigration = $ForceRemigration.IsPresent -or $ForceRemigrationDefault
 
+# Diagnostics run before tenant validation so they can be collected without enrollment details.
+if ($DiagnoseOnly.IsPresent) {
+    if (-not (Test-IsElevated)) {
+        Log-Error "Must be run elevated (Administrator)."
+        exit 1
+    }
+
+    $script:DebugMode = $true
+    Invoke-MdmDiagnostics
+    Log-Info "Script exit code: 0 (diagnostics only, no changes made)"
+    exit 0
+}
+
 if (-not (Test-TenantParams -TenantName $tenantName -BlueprintId $blueprintId -EnrollmentCode $enrollmentCode -TenantId $tenantId -TenantLocation $tenantLocation)) {
     Log-Error "Script exit code: 1"
     exit 1
@@ -1842,19 +3212,68 @@ if (-not (Test-IsElevated)) {
 }
 
 $candidateArray = @(Get-EnrollmentCandidates)
+
+# A linked MMPC enrollment must be torn down before its primary. Windows defines the link
+# relative to the primary, so removing the primary first destroys the context needed to unenroll
+# the link cleanly, and registry enumeration order does not guarantee the right sequence.
+# No-op on devices with no linked enrollment.
+if ($candidateArray.Count -gt 1) {
+    $linkedCandidates = @($candidateArray | Where-Object { $_.IsLinkedMmpc })
+    if ($linkedCandidates.Count -gt 0) {
+        $otherCandidates = @($candidateArray | Where-Object { -not $_.IsLinkedMmpc })
+        $candidateArray = @($linkedCandidates + $otherCandidates)
+        Log-Info ("Reordered enrollments so {0} linked MMPC enrollment(s) are processed before the primary." -f $linkedCandidates.Count)
+    }
+}
+
 if (-not $forceRemigration -and $candidateArray.Count -gt 0) {
-    $allKandjiOrIru = $true
-    foreach ($c in $candidateArray) {
+    # A linked MMPC enrollment always reports ProviderID "Microsoft Device Management" no matter
+    # which MDM created it, so it can never satisfy the Kandji/Iru test on its own terms. Judge the
+    # primaries, then treat a link as ours only when the primary that created it is ours. Without
+    # that, an Iru-created linked enrollment would defeat this check and a scheduled run would
+    # unenroll and re-enroll an already-managed device every time.
+    $primaryCandidates = @($candidateArray | Where-Object { -not $_.IsLinkedMmpc })
+    $linkedForSkipCheck = @($candidateArray | Where-Object { $_.IsLinkedMmpc })
+
+    # No surviving primary means any link is orphaned and still needs teardown.
+    $allKandjiOrIru = $primaryCandidates.Count -gt 0
+    if ($primaryCandidates.Count -eq 0) {
+        Log-Info "Only linked MMPC enrollment(s) found with no surviving primary; treating as orphaned and continuing with migration."
+    }
+
+    foreach ($c in $primaryCandidates) {
         if (-not (Test-IsKandjiOrIruProviderId -ProviderId $c.ProviderId)) {
+            Log-Debug ("Primary enrollment '{0}' has ProviderID '{1}', which is not Kandji/Iru." -f $c.Id, $c.ProviderId)
             $allKandjiOrIru = $false
             break
         }
     }
+
     if ($allKandjiOrIru) {
-        Log-Info "Device is already enrolled to Kandji/Iru (every enrollment ProviderID contains 'kandji' or 'iru'). Skipping unenroll and re-enrollment."
-        foreach ($enr in $candidateArray) {
-            Log-Info ("  Enrollment ID={0}, ProviderID='{1}'" -f $enr.Id, $enr.ProviderId)
+        foreach ($link in $linkedForSkipCheck) {
+            $ownedByUs = $false
+            foreach ($primary in $primaryCandidates) {
+                if (([string]$primary.Id).Equals([string]$link.LinkedFrom, [System.StringComparison]::InvariantCultureIgnoreCase)) {
+                    $ownedByUs = $true
+                    break
+                }
+            }
+
+            if (-not $ownedByUs) {
+                Log-Info ("Linked MMPC enrollment '{0}' is not owned by a Kandji/Iru primary (LinkedFrom='{1}'); continuing with migration." -f $link.Id, $link.LinkedFrom)
+                $allKandjiOrIru = $false
+                break
+            }
         }
+    }
+
+    if ($allKandjiOrIru) {
+        Log-Info "Device is already enrolled to Kandji/Iru. Skipping unenroll and re-enrollment."
+        foreach ($enr in $candidateArray) {
+            $kind = if ($enr.IsLinkedMmpc) { "linked MMPC" } else { "primary     " }
+            Log-Info ("  {0}  ID={1}, ProviderID='{2}'" -f $kind, $enr.Id, $enr.ProviderId)
+        }
+        Log-Info "Leaving the Kandji/Iru primary and its linked MMPC enrollment in place."
         Log-Info "Use -ForceRemigration to unenroll and re-enroll regardless of provider."
         Log-Info "Script exit code: 0 (already on target stack)"
         exit 0
@@ -1881,18 +3300,60 @@ try {
 
     $candidateCount = $candidateArray.Count
 
+    # Outside the enrollment-count check on purpose. The dual-enrollment task can be armed before
+    # the linked enrollment record exists, which is how a device becomes MMPC enrolled part-way
+    # through a migration. A device with no enrollments at all can still have the task waiting, so
+    # gating this on having found an enrollment would miss the case it exists to prevent.
+    $removedDualTask = Remove-MmpcDualEnrollmentTask
+    $script:SummaryMmpcTask = if ($removedDualTask) { "removed" } else { "not present" }
+
     if ($candidateCount -eq 0) {
         Log-Info "No enrollment IDs found after filtering. Device appears not currently MDM enrolled."
         Log-Info "Skipping unenrollment and moving directly to registration."
     } else {
         Log-Info ("Found {0} enrollment(s) to process." -f $candidateCount)
 
+        $linkedCount = @($candidateArray | Where-Object { $_.IsLinkedMmpc }).Count
+        Log-Info ("Of those, {0} are linked MMPC / declared-configuration enrollment(s) and {1} are primary MDM enrollment(s)." -f $linkedCount, ($candidateCount - $linkedCount))
+
+        foreach ($c in $candidateArray) {
+            Register-EnrollmentOutcome `
+                -EnrollmentId $c.Id `
+                -ProviderId $c.ProviderId `
+                -IsLinkedMmpc:([bool]$c.IsLinkedMmpc) `
+                -LinkedFrom $c.LinkedFrom `
+                -CertThumbprint $c.DmpCertThumbprint
+        }
+
         $successes = 0
         $failures = 0
 
+        # Pass 1 - unenroll everything. Linked enrollments go first because a link is defined
+        # relative to its primary, so unenrolling the primary first destroys the context Windows
+        # needs to tear the link down cleanly. Cleanup is deliberately deferred to pass 2 so that
+        # no primary enrollment's keys are mutated while it is still enrolled.
         foreach ($c in $candidateArray) {
             Log-Info ("Attempting unenroll: ID={0}, ProviderID='{1}', UPN='{2}'" -f $c.Id, $c.ProviderId, $c.Upn)
+
             try {
+                if ($c.IsLinkedMmpc) {
+                    Log-Info ("Enrollment '{0}' is a linked MMPC / declared-configuration enrollment (linked from '{1}')." -f $c.Id, $c.LinkedFrom)
+
+                    # Documented teardown is LinkedEnrollment/Unenroll, which is an OMA-DM Exec
+                    # node. Try it locally through the WMI bridge first; it no-ops if absent.
+                    try {
+                        if (Invoke-LinkedEnrollmentUnenrollViaBridge) {
+                            Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Bridge -Value "Unenroll invoked via WMI bridge"
+                            $null = Wait-ForEnrollmentRemoval -EnrollmentId $c.Id -PrimaryEnrollmentId $c.LinkedFrom -TimeoutSeconds 60
+                        } else {
+                            Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Bridge -Value "no DMClient bridge class available (expected on most builds)"
+                        }
+                    } catch {
+                        Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Bridge -Value ("attempt threw: {0}" -f $_.Exception.Message)
+                        Log-Debug ("LinkedEnrollment CSP attempt failed: {0}" -f $_.Exception.Message)
+                    }
+                }
+
                 # Retry logic: Only retry once (2 attempts total) for this specific enrollment ID
                 # Each attempt will try the full process: primary -> MTA -> STA
                 $attempt = 1
@@ -1930,25 +3391,31 @@ try {
                 if ($rc -eq 0) {
                     $successes++
 
+                    Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Unenroll -Value ("HRESULT 0x00000000 (success) on attempt {0}" -f $attempt)
                     Log-Info ("SUCCESS: UnregisterDeviceWithManagement('{0}') returned 0 on retry attempt {1}." -f $c.Id, $attempt)
-
-                    # Clean up all enrollment artifacts (scheduled tasks, registry keys) since unenrollment was successful
-                    Remove-EnrollmentArtifacts -EnrollmentId $c.Id
                 } elseif ($anyThreadTimedOut) {
                     # Thread timed out on both attempts (or any stage timed out) - mark as failure but continue anyway
                     $failures++
+                    Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Unenroll -Value ("thread timed out at stage '{0}' after {1} attempt(s); HRESULT 0x{2:X8}, exception 0x{3:X8}" -f $stage, $attempt, ($rc -band 0xFFFFFFFF), ($exceptionCode -band 0xFFFFFFFF))
                     Log-Warn ("FAILED: UnregisterDeviceWithManagement('{0}') thread timed out during attempt(s). Return code: 0x{1:X8}, ExceptionCode: 0x{2:X8}, Stage: {3}, CurrentThreadTimedOut: {4}" -f $c.Id, ($rc -band 0xFFFFFFFF), ($exceptionCode -band 0xFFFFFFFF), $stage, $threadTimedOut)
-                    Log-Info ("Continuing to enrollment anyway - if device is still enrolled, enrollment will fail; otherwise it will proceed.")
+                    Log-Info ("Continuing to cleanup anyway - artifact removal is driven by what survives, not by this return code.")
                 } else {
                     $failures++
+                    Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Unenroll -Value ("HRESULT 0x{0:X8} after {1} attempt(s)" -f ($rc -band 0xFFFFFFFF), $attempt)
                     Log-Warn ("FAILED: UnregisterDeviceWithManagement('{0}') returned 0x{1:X8}." -f $c.Id, ($rc -band 0xFFFFFFFF))
-                    Log-Info ("Continuing to enrollment anyway - if device is still enrolled, enrollment will fail; otherwise it will proceed.")
+                    Log-Info ("Continuing to cleanup anyway - artifact removal is driven by what survives, not by this return code.")
+                }
+
+                # Give Windows a chance to finish its own asynchronous teardown before we look.
+                if ($c.IsLinkedMmpc) {
+                    $null = Wait-ForEnrollmentRemoval -EnrollmentId $c.Id -PrimaryEnrollmentId $c.LinkedFrom -TimeoutSeconds 30
                 }
             } catch {
                 $failures++
+                Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Unenroll -Value ("exception: {0}" -f $_.Exception.Message)
                 Log-Error ("EXCEPTION during unregister for enrollment ID '{0}': {1}" -f $c.Id, $_.Exception.Message)
                 Log-Debug ("Exception details: {0}" -f $_.Exception.ToString())
-                Log-Info ("Continuing to enrollment anyway - if device is still enrolled, enrollment will fail; otherwise it will proceed.")
+                Log-Info ("Continuing to cleanup anyway - artifact removal is driven by what survives, not by this exception.")
             }
         }
 
@@ -1956,7 +3423,77 @@ try {
         if ($failures -gt 0) {
             Log-Warn "Continuing to registration despite unenrollment failures."
         }
+
+        # Pass 2 - remove whatever survived, in the same order. Cleanup is driven by what is
+        # actually still on disk rather than by the unenroll HRESULT: a failed or partial
+        # unenroll is exactly the case where residue matters most, and every helper skips what
+        # Windows already removed.
+        Log-Info "Starting artifact cleanup pass..."
+
+        foreach ($c in $candidateArray) {
+            # Thumbprints belonging to any other enrollment are off-limits for cert cleanup.
+            $protectedThumbprints = @($candidateArray | Where-Object { $_.Id -ne $c.Id } | ForEach-Object { $_.DmpCertThumbprint })
+
+            try {
+                $cleanup = Remove-EnrollmentArtifacts `
+                    -EnrollmentId $c.Id `
+                    -PrimaryEnrollmentId $c.LinkedFrom `
+                    -IsLinkedMmpc:$c.IsLinkedMmpc `
+                    -CertificateThumbprint $c.DmpCertThumbprint `
+                    -ProtectedThumbprints $protectedThumbprints
+
+                Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Artifacts -Value (
+                    "{0} task(s), {1} registry key(s) ({2} skipped, {3} failed), {4} declared-config item(s), {5} TaskCache entr(ies)" -f `
+                        $cleanup.TasksRemoved, $cleanup.RegistryKeysRemoved, $cleanup.RegistryKeysSkipped,
+                        $cleanup.RegistryKeysFailed, $cleanup.MmpcItemsRemoved, $cleanup.TaskCacheEntriesRemoved
+                )
+
+                $certSummary = if ([string]::IsNullOrWhiteSpace($c.DmpCertThumbprint)) {
+                    "no DMPCertThumbprint was recorded for this enrollment"
+                } elseif ($cleanup.CertificateRemoved) {
+                    "removed {0}" -f $c.DmpCertThumbprint
+                } else {
+                    "{0} retained - not found in LocalMachine\My, or still referenced by another enrollment" -f $c.DmpCertThumbprint
+                }
+                Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Certificate -Value $certSummary
+            } catch {
+                Set-EnrollmentOutcome -EnrollmentId $c.Id -Field Artifacts -Value ("exception: {0}" -f $_.Exception.Message)
+                Log-Error ("EXCEPTION during artifact cleanup for enrollment ID '{0}': {1}" -f $c.Id, $_.Exception.Message)
+                Log-Debug ("Exception details: {0}" -f $_.Exception.ToString())
+                Log-Info "Continuing with the remaining enrollments."
+            }
+        }
+
+        Log-Info "Artifact cleanup pass complete."
     }
+
+    # Always runs, including on devices that were never MMPC enrolled. Residual
+    # declared-configuration state is what makes Windows send a WinDC JSON discovery request to
+    # the new MDM instead of the MS-MDE2 XML discovery it expects.
+    $residualCleared = Clear-MmpcResidualState
+    $script:SummaryMmpcFlag = if ($residualCleared -gt 0) { "{0} residual item(s) cleared" -f $residualCleared } else { "nothing residual found" }
+
+    # Hard gate. Registration is only attempted when nothing that actually blocks it survived -
+    # a foreign primary enrollment or a non-zero MMPC flag. Stopping here leaves the device on its
+    # original MDM, which is recoverable; pushing on would unenroll it from the old MDM and fail
+    # to enroll it in the new one, which is not.
+    $cleanSlate = Test-EnrollmentCleanSlate
+    if ($cleanSlate.IsBlocked) {
+        $script:SummaryCleanSlate = "BLOCKED - {0} blocking item(s), {1} non-blocking" -f $cleanSlate.Blocking.Count, $cleanSlate.Cosmetic.Count
+        Log-Error "Aborting before registration: residual enrollment state would cause registration to fail."
+        Log-Error "The device has NOT been enrolled to Iru and remains in its pre-registration state."
+        Log-Error "Re-run with -DiagnoseOnly for a full read-only inventory of what is still present."
+        $script:SummaryRegistration = "not attempted (blocked by residual state)"
+        $exitCode = $script:ExitCodeResidualStateBlocked
+        return
+    }
+
+    $script:SummaryCleanSlate = if ($cleanSlate.Cosmetic.Count -gt 0) {
+        "passed with {0} non-blocking residual item(s)" -f $cleanSlate.Cosmetic.Count
+    } else {
+        "passed clean"
+    }
+
     Log-Info "Device is ready for MDM registration"
     Log-Info "Proceeding to MDM registration"
     Log-Info "Calling enrollment API to register device..."
@@ -1966,12 +3503,15 @@ try {
         Log-Error "MDM registration failed."
         if ($registrationFailure -eq 0) {
             $exitCode = 1
+            $script:SummaryRegistration = "FAILED (no HRESULT reported)"
         } else {
             $exitCode = [int]$registrationFailure
+            $script:SummaryRegistration = "FAILED with 0x{0:X8}" -f ([int]$registrationFailure -band 0xFFFFFFFF)
         }
         return
     }
 
+    $script:SummaryRegistration = "succeeded"
     Log-Info "MDM migration completed successfully."
 
     # Execute application uninstalls after successful MDM registration
@@ -1990,8 +3530,19 @@ try {
     }
 } finally {
     Cleanup-MdmRegistration
+
+    # In the finally block so the summary is emitted on every path, including the residual-state
+    # abort and any unhandled exception.
+    try {
+        Write-RunSummary -FinalExitCode $exitCode
+    } catch {
+        Log-Warn ("Failed to write run summary: {0}" -f $_.Exception.Message)
+    }
+
     if ($exitCode -eq 0) {
         Log-Info "Script exit code: 0 (success)"
+    } elseif ($exitCode -eq $script:ExitCodeResidualStateBlocked) {
+        Log-Error ("Script exit code: {0} (aborted before registration - residual enrollment state)" -f $exitCode)
     } else {
         Log-Error ("Script exit code: {0}" -f $exitCode)
     }
