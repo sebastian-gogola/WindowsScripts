@@ -1,0 +1,3961 @@
+﻿Function Invoke-HardeningKitty {
+
+    <#
+    .SYNOPSIS
+
+        Invoke-HardeningKitty - Checks and hardens your Windows configuration
+
+
+         =^._.^=
+        _(      )/  HardeningKitty
+
+
+        Author:  Michael Schneider
+        License: MIT
+        Required Dependencies: None
+        Optional Dependencies: None
+
+
+    .DESCRIPTION
+
+        HardeningKitty supports hardening of a Windows system. The configuration of the system is
+        retrieved and assessed using a finding list. In addition, the system can be hardened according
+        to predefined values. HardeningKitty reads settings from the registry and uses other modules
+        to read configurations outside the registry.
+
+    .PARAMETER FileFindingList
+
+        Path to a finding list in CSV format. HardeningKitty has one list each for machine and user settings.
+
+    .PARAMETER Mode
+
+        The mode Config only retrieves the settings, while the mode Audit performs an assessment of the settings.
+        The mode HailMary hardens the system according to recommendations of the HardeningKitty list.
+
+    .PARAMETER Source
+
+        Defines whether the system is configured using Group Policy (GPO) or Microsoft Intune. The information
+        gathering process differs between these sources.
+
+    .PARAMETER EmojiSupport
+
+        The use of emoji is activated. The terminal should support this accordingly. Windows Terminal
+        offers full support.
+
+    .PARAMETER Log
+
+        The logging function is activated. The script output is additionally logged in a file. The file
+        name is assigned by HardeningKitty itself and the file is stored in the same directory as the script.
+
+    .PARAMETER LogFile
+
+        The name and location of the log file can be defined by the user.
+
+    .PARAMETER Report
+
+        The retrieved settings and their assessment result are stored in CSV format in a machine-readable format.
+        The file name is assigned by HardeningKitty itself and the file is stored in the same directory as the script.
+
+    .PARAMETER ReportFile
+
+        The name and location of the report file can be defined by the user.
+
+    .PARAMETER Backup
+
+        The retrieved settings and their assessment result are stored in CSV format in a machine-readable format with all value to backup your previous config.
+
+    .PARAMETER SkipMachineInformation
+
+        Information about the system is not queried and displayed. This may be useful while debugging or
+        using multiple lists on the same system.
+
+    .PARAMETER SkipUserInformation
+
+        Information about the user is not queried and displayed. This may be useful while debugging or
+        using multiple lists on the same system.
+
+    .PARAMETER SkipLanguageWarning
+
+        Do not show the language warning on an no-english Windows system.
+
+    .PARAMETER SkipRestorePoint
+
+        Do not create a System Restore Point in HailMary mode. HardeningKitty strongly recommends to backup your system before running Hail Mary. However,
+        creating can be skipped, for example, if HailMary is executed several times in a row. By default, Windows allows a restore point every 24 hours.
+        Another reason is when HardeningKitty is run as a user and thus lacks privileges.
+
+    .PARAMETER Filter
+
+        The Filter parameter can be used to filter the hardening list. For this purpose the PowerShell ScriptBlock syntax must be used, for example { $_.ID -eq 4505 }.
+        The following elements are useful for filtering: ID, Category, Name, Method, and Severity.
+
+    .PARAMETER GPOname
+
+        The GPOname parameter defines the name of the GPO policy.
+
+    .PARAMETER AllowCustomList
+
+        Use a finding list that is not verified against the maintainer signature (a custom or modified list) in a write mode (HailMary, GPO).
+        Running your own list is your own risk.
+
+    .EXAMPLE
+        Invoke-HardeningKitty -Mode Audit -Log -Report
+
+        HardeningKitty performs an audit, saves the results and creates a log file
+
+    .EXAMPLE
+        Invoke-HardeningKitty -FileFindingList finding_list_0x6d69636b_user.csv -SkipMachineInformation
+
+        HardeningKitty performs an audit with a specific list and does not show machine information
+
+    .EXAMPLE
+        Invoke-HardeningKitty -Mode Config -Report -ReportFile C:\tmp\my_hardeningkitty_report.csv
+
+        HardeningKitty uses the default list, and saves the results in a specific file
+
+    .EXAMPLE
+        Invoke-HardeningKitty -Filter { $_.Severity -eq "Medium" }
+
+        HardeningKitty uses the default list, and checks only tests with the severity Medium
+    #>
+
+    [CmdletBinding()]
+    Param (
+
+        # Definition of the finding list, default is machine setting list
+        [String]
+        $FileFindingList,
+
+        # Choose mode, read system config, audit system config, harden system config
+        [ValidateSet("Audit", "Config", "HailMary", "GPO")]
+        [String]
+        $Mode = "Audit",
+
+        # Choose source, Group Policy or Microsoft Intune
+        [ValidateSet("GPO", "Intune")]
+        [String]
+        $Source = "GPO",
+
+        # Activate emoji support for Windows Terminal
+        [Switch]
+        $EmojiSupport,
+
+        # Create a log file
+        [Switch]
+        $Log,
+
+        # Skip machine information, useful when debugging
+        [Switch]
+        $SkipMachineInformation,
+
+        # Skip user information, useful when debugging
+        [Switch]
+        $SkipUserInformation,
+
+        # Skip language warning, if you understand the risk
+        [Switch]
+        $SkipLanguageWarning,
+
+        # Skip creating a System Restore Point during Hail Mary mode
+        [Switch]
+        $SkipRestorePoint,
+
+        # Define name and path of the log file
+        [String]
+        $LogFile,
+
+        # Create a report file in CSV format
+        [Switch]
+        $Report,
+
+        # Define name and path of the report file
+        [String]
+        $ReportFile,
+
+        # Create a backup config file in CSV format
+        [Switch]
+        $Backup,
+
+        # Define name and path of the backup file
+        [String]
+        $BackupFile,
+
+        # Use PowerShell ScriptBlock syntax to filter the finding list
+        [scriptblock]
+        $Filter,
+
+         # Define name of the GPO name
+        [String]
+        $GPOname,
+
+        # Use a finding list that is not verified against the maintainer signature
+        [Switch]
+        $AllowCustomList
+    )
+
+    Function Write-ProtocolEntry {
+        <#
+        .SYNOPSIS
+            Output of an event with timestamp and different formatting
+            depending on the level. If the Log parameter is set, the
+            output is also stored in a file.
+        #>
+
+        [CmdletBinding()]
+        Param (
+            [String]
+            $Text,
+
+            [String]
+            $LogLevel
+        )
+
+        $Time = Get-Date -Format G
+
+        Switch ($LogLevel) {
+            "Info"    { $Message = "[*] $Time - $Text"; Write-Host $Message; Break }
+            "Debug"   { $Message = "[-] $Time - $Text"; Write-Host -ForegroundColor Cyan $Message; Break }
+            "Warning" { $Message = "[?] $Time - $Text"; Write-Host -ForegroundColor Yellow $Message; Break }
+            "Error"   { $Message = "[!] $Time - $Text"; Write-Host -ForegroundColor Red $Message; Break }
+            "Success" { $Message = "[$] $Time - $Text"; Write-Host -ForegroundColor Green $Message; Break }
+            "Notime"  { $Message = "[*] $Text"; Write-Host -ForegroundColor Gray $Message; Break }
+            Default   { $Message = "[*] $Time - $Text"; Write-Host $Message; }
+        }
+
+        If ($Log) {
+            Add-MessageToFile -Text $Message -File $LogFile
+        }
+    }
+
+    Function Add-MessageToFile {
+        <#
+        .SYNOPSIS
+            Write message to a file, this function can be used for logs,
+            reports, backups and more.
+        #>
+
+        [CmdletBinding()]
+        Param (
+            [String]
+            $Text,
+
+            [String]
+            $File
+        )
+
+        try {
+            Add-Content -Path $File -Value $Text -ErrorAction Stop
+        } catch {
+            Write-ProtocolEntry -Text "Error while writing log entries into $File. Aborting..." -LogLevel "Error"
+            Break
+        }
+
+    }
+
+    Function Write-ResultEntry {
+        <#
+        .SYNOPSIS
+            Output of the assessment result with different formatting
+            depending on the severity level. If emoji support is enabled,
+            a suitable symbol is used for the severity rating.
+        #>
+
+        [CmdletBinding()]
+        Param (
+
+            [String]
+            $Text,
+
+            [String]
+            $SeverityLevel
+        )
+
+        If ($EmojiSupport) {
+
+            Switch ($SeverityLevel) {
+
+                "Passed" { $Emoji = [char]::ConvertFromUtf32(0x1F63A); $Message = "[$Emoji] $Text"; Write-Host -ForegroundColor Gray $Message; Break }
+                "Low"    { $Emoji = [char]::ConvertFromUtf32(0x1F63C); $Message = "[$Emoji] $Text"; Write-Host -ForegroundColor Cyan $Message; Break }
+                "Medium" { $Emoji = [char]::ConvertFromUtf32(0x1F63F); $Message = "[$Emoji] $Text"; Write-Host -ForegroundColor Yellow $Message; Break }
+                "High"   { $Emoji = [char]::ConvertFromUtf32(0x1F640); $Message = "[$Emoji] $Text"; Write-Host -ForegroundColor Red $Message; Break }
+                Default  { $Message = "[*] $Text"; Write-Host $Message; }
+            }
+
+        } Else {
+
+            Switch ($SeverityLevel) {
+
+                "Passed" { $Message = "[+] $Text"; Write-Host -ForegroundColor Gray $Message; Break }
+                "Low"    { $Message = "[-] $Text"; Write-Host -ForegroundColor Cyan $Message; Break }
+                "Medium" { $Message = "[$] $Text"; Write-Host -ForegroundColor Yellow $Message; Break }
+                "High"   { $Message = "[!] $Text"; Write-Host -ForegroundColor Red $Message; Break }
+                Default  { $Message = "[*] $Text"; Write-Host $Message; }
+            }
+        }
+    }
+
+    Function Get-IniContent ($filePath) {
+        <#
+        .SYNOPSIS
+            Read a .ini file into a tree of hashtables
+
+        .NOTES
+            Original source see https://devblogs.microsoft.com/scripting/use-powershell-to-work-with-any-ini-file/
+        #>
+
+        $ini = @{}
+        switch -regex -file $FilePath {
+            "^\[(.+)\]" {
+                # Section
+                $section = $matches[1]
+                $ini[$section] = @{}
+                $CommentCount = 0
+            }
+            "^(;.*)$" {
+                # Comment
+                $value = $matches[1]
+                $CommentCount = $CommentCount + 1
+                $name = "Comment" + $CommentCount
+                $ini[$section][$name] = $value
+            }
+            "(.+?)\s*=(.*)" {
+                # Key
+                $name, $value = $matches[1..2]
+                $ini[$section][$name] = $value
+            }
+        }
+
+        return $ini
+    }
+
+    Function Out-IniFile($InputObject, $FilePath, $Encoding) {
+        <#
+        .SYNOPSIS
+            Write a hashtable out to a .ini file
+
+        .NOTES
+            Original source see https://devblogs.microsoft.com/scripting/use-powershell-to-work-with-any-ini-file/
+        #>
+
+        $outFile = New-Item -Force -ItemType file -Path $Filepath
+
+        foreach ($i in $InputObject.keys) {
+            if (!($($InputObject[$i].GetType().Name) -eq "Hashtable")) {
+                #No Sections
+                Add-Content -Encoding $Encoding -Path $outFile -Value "$i=$($InputObject[$i])"
+            } else {
+                #Sections
+                Add-Content -Encoding $Encoding -Path $outFile -Value "[$i]"
+                Foreach ($j in ($InputObject[$i].keys | Sort-Object)) {
+                    if ($j -match "^Comment[\d]+") {
+                        Add-Content -Encoding $Encoding -Path $outFile -Value "$($InputObject[$i][$j])"
+                    } else {
+                        Add-Content -Encoding $Encoding -Path $outFile -Value "$j=$($InputObject[$i][$j])"
+                    }
+                }
+                Add-Content -Encoding $Encoding -Path $outFile -Value ""
+            }
+        }
+    }
+
+    Function Get-HashtableValueDeep {
+        <#
+        .SYNOPSIS
+            Get a value from a tree of hashtables
+        #>
+
+        [CmdletBinding()]
+        Param (
+
+            [Hashtable]
+            $Table,
+
+            [String]
+            $Path
+        )
+
+        $Key = $Path.Split('\', 2)
+
+        $Entry = $Table[$Key[0]]
+
+        if ($Entry -is [hashtable] -and $Key.Length -eq 1) {
+            throw "Path is incomplete (expected a leaf but still on a branch)"
+        }
+
+        if ($Entry -is [hashtable]) {
+            return Get-HashtableValueDeep $Entry $Key[1];
+        } else {
+            if ($Key.Length -eq 1) {
+                return $Entry
+            } else {
+                throw "Path is too long (expected a branch but arrived at a leaf before the end of the path)"
+            }
+        }
+    }
+
+    Function Set-HashtableValueDeep {
+        <#
+        .SYNOPSIS
+            Set a value in a tree of hashtables, using recursion.
+        #>
+
+        [CmdletBinding()]
+        Param (
+            [Hashtable]
+            $Table,
+
+            [String]
+            $Path,
+
+            [String]
+            $Value
+        )
+
+        $Key = $Path.Split('\', 2)
+
+        $Entry = $Table[$Key[0]]
+
+        if ($Key.Length -eq 2) {
+            if ($null -eq $Entry) {
+                $Table[$Key[0]] = @{}
+            } elseif ($Entry -isnot [hashtable]) {
+                throw "Not hashtable"
+            }
+
+            return Set-HashtableValueDeep -Table $Table[$Key[0]] -Path $Key[1] -Value $Value;
+        } elseif ($Key.Length -eq 1) {
+            $Table[$Key[0]] = $Value;
+        }
+    }
+
+    Function Get-SidFromAccount {
+        <#
+        .SYNOPSIS
+            Translate the account name (user or group) into the Security Identifier (SID)
+        #>
+
+        [CmdletBinding()]
+        Param (
+
+            [String]
+            $AccountName
+        )
+
+        try {
+
+            $AccountObject = New-Object System.Security.Principal.NTAccount($AccountName)
+            $AccountSid = $AccountObject.Translate([System.Security.Principal.SecurityIdentifier]).Value
+
+        } catch {
+
+            # If translation fails, return account name
+            $AccountSid = $AccountName
+        }
+
+        Return $AccountSid
+    }
+
+    Function Get-AccountFromSid {
+        <#
+        .SYNOPSIS
+            Translate the Security Identifier (SID) into the account name (user or group)
+        #>
+
+        [CmdletBinding()]
+        Param (
+
+            [String]
+            $AccountSid
+        )
+
+        try {
+
+            $AccountObject = New-Object System.Security.Principal.SecurityIdentifier ($AccountSid)
+            $AccountName = $AccountObject.Translate([System.Security.Principal.NTAccount]).Value
+
+        } catch {
+
+            # If translation fails, return account SID
+            $AccountName = $AccountSid
+        }
+
+        Return $AccountName
+    }
+
+    Function Translate-SidFromWellkownAccount {
+        <#
+        .SYNOPSIS
+            Translate the well-known account name (user or group) into the Security Identifier (SID)
+            No attempt is made to get a Domain SID to identify groups such as Domain Admins,
+            as the possibility for false positives is too great. In this case the account name is returned.
+        #>
+
+        [CmdletBinding()]
+        Param (
+
+            [String]
+            $AccountName
+        )
+
+        # Get Computer SID and set well-known local user SID
+        $ComputerSid = ((Get-LocalUser | Select-Object -First 1).SID).AccountDomainSID.ToString()
+        $LocalAdminSid = $ComputerSid + "-500"
+        $LocalGuestSid = $ComputerSid + "-501"
+
+        Switch ($AccountName) {
+            "Administrator" { $AccountSid = $LocalAdminSid; Break }
+            "Guest" { $AccountSid = $LocalGuestSid; Break }
+            "BUILTIN\Account Operators" { $AccountSid = "S-1-5-32-548"; Break }
+            "BUILTIN\Administrators" { $AccountSid = "S-1-5-32-544"; Break }
+            "BUILTIN\Backup Operators" { $AccountSid = "S-1-5-32-551"; Break }
+            "BUILTIN\Guests" { $AccountSid = "S-1-5-32-546"; Break }
+            "BUILTIN\Power Users" { $AccountSid = "S-1-5-32-547"; Break }
+            "BUILTIN\Print Operators" { $AccountSid = "S-1-5-32-550"; Break }
+            "BUILTIN\Remote Desktop Users" { $AccountSid = "S-1-5-32-555"; Break }
+            "BUILTIN\Server Operators" { $AccountSid = "S-1-5-32-549"; Break }
+            "BUILTIN\Users" { $AccountSid = "S-1-5-32-545"; Break }
+            "Everyone" { $AccountSid = "S-1-1-0"; Break }
+            "NT AUTHORITY\ANONYMOUS LOGON" { $AccountSid = "S-1-5-7"; Break }
+            "NT AUTHORITY\Authenticated Users" { $AccountSid = "S-1-5-11"; Break }
+            "NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS" { $AccountSid = "S-1-5-9"; Break }
+            "NT AUTHORITY\IUSR" { $AccountSid = "S-1-5-17"; Break }
+            "NT AUTHORITY\Local account and member of Administrators group" { $AccountSid = "S-1-5-114"; Break }
+            "NT AUTHORITY\Local account" { $AccountSid = "S-1-5-113"; Break }
+            "NT AUTHORITY\LOCAL SERVICE" { $AccountSid = "S-1-5-19"; Break }
+            "NT AUTHORITY\NETWORK SERVICE" { $AccountSid = "S-1-5-20"; Break }
+            "NT AUTHORITY\SERVICE" { $AccountSid = "S-1-5-6"; Break }
+            "NT AUTHORITY\SYSTEM" { $AccountSid = "S-1-5-18"; Break }
+            "NT SERVICE\WdiServiceHost" { $AccountSid = "S-1-5-80-3139157870-2983391045-3678747466-658725712-1809340420"; Break }
+            "NT VIRTUAL MACHINE\Virtual Machines" { $AccountSid = "S-1-5-83-0"; Break }
+            "RESTRICTED SERVICES\PrintSpoolerService" { $AccountSid = "S-1-5-99-216390572-1995538116-3857911515-2404958512-2623887229"; Break }
+            "Window Manager\Window Manager Group" { $AccountSid = "S-1-5-90-0"; Break }            
+            Default { $AccountSid = $AccountName }
+        }
+
+        Return $AccountSid
+    }
+
+    Function Write-NotAdminError {
+        [CmdletBinding()]
+        param (
+            [String]
+            $FindingID,
+            [String]
+            $FindingName,
+            [string]
+            $FindingMethod
+        )
+
+        $Script:StatsError++
+        $Message = "ID " + $FindingID + ", " + $FindingName + ", Method " + $FindingMethod + " requires admin privileges. Test skipped."
+        Write-ProtocolEntry -Text $Message -LogLevel "Error"
+    }
+
+    Function Write-BinaryError {
+        [CmdletBinding()]
+        param (
+            [String]
+            $Binary,
+            [String]
+            $FindingID,
+            [String]
+            $FindingName,
+            [string]
+            $FindingMethod
+        )
+        $Script:StatsError++
+        $Message = "ID " + $FindingID + ", " + $FindingName + ", Method " + $FindingMethod + " requires $Binary and it was not found. Test skipped."
+        Write-ProtocolEntry -Text $Message -LogLevel "Error"
+    }
+
+    Function New-HardeningKittyTempDirectory {
+        <#
+        .SYNOPSIS
+            Create a private working directory for temporary files.
+
+        .DESCRIPTION
+            This function creates a dedicated directory with a random name and an ACL restricted to
+            the current user (inheritance disabled), so temporary files cannot be pre-created,
+            tampered with or read by other users. This protects the auditpol backup and the secedit exports
+            which contain security configuration information.
+        #>
+
+        $TempPath = [System.IO.Path]::GetTempPath()
+        Do {
+            $DirectoryPath = Join-Path -Path $TempPath -ChildPath ("HardeningKitty_" + [System.IO.Path]::GetRandomFileName())
+        } Until (-Not (Test-Path -LiteralPath $DirectoryPath))
+
+        $Directory = New-Item -Path $DirectoryPath -ItemType Directory -ErrorAction Stop
+
+        # Restrict access to the current user and remove inherited permissions
+        $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $Acl = Get-Acl -Path $Directory.FullName
+        $Acl.SetAccessRuleProtection($true, $false)
+        $AccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $CurrentUser,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $Acl.AddAccessRule($AccessRule)
+        Set-Acl -Path $Directory.FullName -AclObject $Acl
+
+        Return $Directory.FullName
+    }
+
+    Function New-HardeningKittyTempFile {
+        <#
+        .SYNOPSIS
+            Return a path to a uniquely named temporary file inside the private
+            HardeningKitty working directory.
+
+        .DESCRIPTION
+            The random file name comes from a cryptographically strong source. With
+            -CreateFile an empty file is created, mirroring the GetTempFileName() behaviour.
+            Without it only a path is returned, which is required by auditpol.exe
+            as it refuses to back up into an existing file.
+        #>
+
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [String]
+            $Directory,
+            [Switch]
+            $CreateFile
+        )
+        Do {
+            $FilePath = Join-Path -Path $Directory -ChildPath ([System.IO.Path]::GetRandomFileName())
+        } Until (-Not (Test-Path -LiteralPath $FilePath))
+        If ($CreateFile) {
+            New-Item -Path $FilePath -ItemType File -ErrorAction Stop | Out-Null
+        }
+        Return $FilePath
+    }
+
+    Function Confirm-FindingListIntegrity {
+        <#
+        .SYNOPSIS
+            Verify a finding list against the signed official manifest.
+
+        .DESCRIPTION
+            Official finding lists are attested by lists\hardeningkitty_lists_manifest.psd1, which
+            maps each official list file name to its SHA-256 hash and is signed with a detached
+            PKCS#7 signature (hardeningkitty_lists_manifest.psd1.p7s) by the maintainer certificate.
+
+            A list is "verified" when the detached signature is intact, the signer thumbprint matches
+            the pinned thumbprint, and the list SHA-256 matches the manifest entry for its name.
+
+            The signature is checked with SignedCms.CheckSignature($true), which validates signature
+            integrity only and deliberately ignores the certificate chain and validity period. The
+            trust anchor is the pinned thumbprint, not a public CA, so a self-signed certificate is
+            sufficient and no timestamp is required.
+
+            This function never throws; it always returns a status object with the properties
+            Verified (bool), Reason (string) and Hash (string, SHA-256 of the list).
+        #>
+
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [String]
+            $ListPath,
+            [Parameter(Mandatory = $true)]
+            [String]
+            $ManifestPath,
+            [Parameter(Mandatory = $true)]
+            [String]
+            $SignaturePath,
+            [String]
+            $PinnedThumbprint
+        )
+
+        $Hash = ""
+
+        try {
+
+            # Hash of the list under test (reported even when verification fails)
+            If (Test-Path -LiteralPath $ListPath) {
+                $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ListPath).Hash
+            }
+
+            # Trust anchor must be configured
+            If ([String]::IsNullOrWhiteSpace($PinnedThumbprint) -or $PinnedThumbprint -eq "REPLACE_WITH_MAINTAINER_CERT_THUMBPRINT") {
+                Return [pscustomobject] @{ Verified = $false; Reason = "signing thumbprint not configured"; Hash = $Hash }
+            }
+
+            # Manifest and detached signature must be present
+            If (-Not (Test-Path -LiteralPath $ManifestPath) -or -Not (Test-Path -LiteralPath $SignaturePath)) {
+                Return [pscustomobject] @{ Verified = $false; Reason = "signed manifest not found"; Hash = $Hash }
+            }
+
+            # The PKCS#7/CMS types (SignedCms, ContentInfo) live in the System.Security assembly,
+            # which is not loaded by default on Windows PowerShell 5.1 (already present on PS 7).
+            If (-not ([System.Management.Automation.PSTypeName]'System.Security.Cryptography.Pkcs.SignedCms').Type) {
+                Add-Type -AssemblyName System.Security
+            }
+
+            # Verify the detached PKCS#7 signature over the manifest bytes (integrity only)
+            $ManifestBytes = [System.IO.File]::ReadAllBytes($ManifestPath)
+            $SignatureBytes = [System.IO.File]::ReadAllBytes($SignaturePath)
+            $ContentInfo = New-Object System.Security.Cryptography.Pkcs.ContentInfo(, $ManifestBytes)
+            $SignedCms = New-Object System.Security.Cryptography.Pkcs.SignedCms($ContentInfo, $true)
+            $SignedCms.Decode($SignatureBytes)
+            $SignedCms.CheckSignature($true)
+
+            # Signer must be the pinned maintainer certificate
+            $SignerThumbprint = $SignedCms.SignerInfos[0].Certificate.Thumbprint
+            If ($SignerThumbprint -ne $PinnedThumbprint) {
+                Return [pscustomobject] @{ Verified = $false; Reason = "manifest signed by an untrusted certificate"; Hash = $Hash }
+            }
+
+            # The manifest content is trustworthy only now that its signature is verified
+            $Manifest = Import-PowerShellDataFile -Path $ManifestPath
+            $ListName = Split-Path -Path $ListPath -Leaf
+            $ExpectedHash = $Manifest.Lists[$ListName]
+
+            If ([String]::IsNullOrEmpty($ExpectedHash)) {
+                Return [pscustomobject] @{ Verified = $false; Reason = "not an official list"; Hash = $Hash }
+            }
+            If ($ExpectedHash -ne $Hash) {
+                Return [pscustomobject] @{ Verified = $false; Reason = "list content does not match the signed manifest"; Hash = $Hash }
+            }
+
+            Return [pscustomobject] @{ Verified = $true; Reason = "official"; Hash = $Hash }
+
+        } catch {
+            Return [pscustomobject] @{ Verified = $false; Reason = "verification error: $($_.Exception.Message)"; Hash = $Hash }
+        }
+    }
+
+    Function ConvertToInt {
+        [CmdletBinding()]
+        Param (
+
+            [String]
+            $string
+        )
+        $int64 = $null
+        $int32 = $null
+
+        # Attempt to parse the string as an Int32
+        if ([Int32]::TryParse($string, [ref]$int32)) {
+            return $int32
+        }
+
+        # Attempt to parse the string as an Int64
+        if ([Int64]::TryParse($string, [ref]$int64)) {
+            return $int64
+        }
+
+        # If the string cannot be parsed as either an Int32 or an Int64, throw an error
+        throw "Cannot convert string '$string' to an integer."
+    }
+
+    Function Get-IntuneResult {
+        # Check if the finding list has an Intune setting
+        If ([string]::IsNullOrEmpty($Finding.RegistryPathIntune)) {
+            $Result = "NotSupported"
+        } Else {
+            # Intune user policy settings contain a SID value, we need to replace it
+            # We get the value from the registry, as the SID must not match the current user's SID
+            If ([string] $Finding.RegistryPathIntune.contains("{SID}") -or [string] $Finding.RegistryPathDCP.contains("{SID}")) {
+                $FindingUserSIDPath = Get-ChildItem -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\" | Select-String -Pattern "S-1"
+                $FindingUserSID = $FindingUserSIDPath.ToString().Trim().Split("\")
+                # Replace SID in Intune path
+                If ([string] $Finding.RegistryPathIntune.contains("{SID}")){
+                    $FindingRegistryPathIntuneUser = $($Finding.RegistryPathIntune).Replace("{SID}",$FindingUserSID[5])
+                    $FindingRegistryPathIntune = $FindingRegistryPathIntuneUser
+                }
+                # Replace SID in DCP path
+                If ([string] $Finding.RegistryPathDCP.contains("{SID}")){
+                    $FindingRegistryPathDCPUser = $($Finding.RegistryPathDCP).Replace("{SID}",$FindingUserSID[5])
+                    $FindingRegistryPathDCP = $FindingRegistryPathDCPUser
+                }
+            } Else {
+                $FindingRegistryPathIntune = $Finding.RegistryPathIntune
+                $FindingRegistryPathDCP = $Finding.RegistryPathDCP
+            }
+            # Check if HardeningKitty needs to get the WinningProvider
+            If ([string]::IsNullOrEmpty($FindingRegistryPathDCP)) {
+                # Get result directly
+                If (Test-Path -Path $FindingRegistryPathIntune) {
+                    try {
+                        $Result = Get-ItemPropertyValue -Path $FindingRegistryPathIntune -Name $Finding.RegistryItemIntune
+                    } catch {
+                        $Result = "NotConfigured"
+                    }
+                } Else {
+                    $Result = "PathNotExists"
+                }
+            } Else {
+                # Check if policy enabled
+                If (Test-Path -Path $FindingRegistryPathDCP) {
+                    try {
+                        # Get the WinningProvider
+                        $FindingWinningProvider = $Finding.RegistryItemIntune + "_WinningProvider"
+                        $WinningProvider = Get-ItemPropertyValue -Path $FindingRegistryPathDCP -Name $FindingWinningProvider
+                        # Use the WinningProvider and get the result
+                        $FindingRegistryPathIntune = $($FindingRegistryPathIntune).Replace("{GUID}",$WinningProvider)
+                        If (Test-Path -Path $FindingRegistryPathIntune) {
+                            try {
+                                $Result = Get-ItemPropertyValue -Path $FindingRegistryPathIntune -Name $Finding.RegistryItemIntune
+                            } catch {
+                                $Result = "NotConfigured"
+                            }
+                        } Else {
+                            $Result = "WinningProviderNotExists"
+                        }
+                    } catch {
+                        $Result = "NotConfigured"
+                    }
+                } Else {
+                    $Result = "NotConfigured"
+                }
+            }
+        }
+        return $Result
+    }
+
+    #
+    # Binary Locations
+    #
+    $BinarySecedit  = "C:\Windows\System32\secedit.exe"
+    $BinaryAuditpol = "C:\Windows\System32\auditpol.exe"
+    $BinaryNet      = "C:\Windows\System32\net.exe"
+    $BinaryBcdedit  = "C:\Windows\System32\bcdedit.exe"
+
+    #
+    # Start Main
+    #
+    $HardeningKittyVersion = "0.9.4"
+
+    #
+    # Finding list integrity
+    #
+    $HardeningKittyListSigningThumbprint = "E962C15FED3A489616A6A048B492983679D6F643"
+    $HardeningKittyListManifestName = "hardeningkitty_lists_manifest.psd1"
+
+    #
+    # Log, report and backup file
+    #
+    $Hostname = $env:COMPUTERNAME.ToLower()
+    $FileDate = Get-Date -Format yyyyMMdd-HHmmss
+    $WinSystemLocale = Get-WinSystemLocale
+    $PowerShellVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"
+
+    If ($FileFindingList.Length -eq 0) {
+        $ListName = "finding_list_0x6d69636b_machine"
+    } Else {
+        $ListName = [System.IO.Path]::GetFileNameWithoutExtension($FileFindingList)
+    }
+
+    If ($Log) {
+        If ($LogFile.Length -eq 0) {
+            $LogFile = "hardeningkitty_log_" + $Hostname + "_" + $ListName + "-$FileDate.log"
+        } ElseIf ($(Split-Path -Path $LogFile).Length -ne 0) {
+            If ( -Not(Test-Path -Path $(Split-Path $LogFile))) {
+                $Message = "The path to your log file does not exist."
+                $Log = $false
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Break
+            }
+        }
+    }
+    If ($Report) {
+        If ($ReportFile.Length -eq 0) {
+            $ReportFile = "hardeningkitty_report_" + $Hostname + "_" + $ListName + "-$FileDate.csv"
+        } ElseIf ($(Split-Path -Path $ReportFile).Length -ne 0) {
+            If ( -Not(Test-Path -Path $(Split-Path $ReportFile))) {
+                $Message = "The path to your report file does not exist."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Break
+            }
+        }
+    }
+    If ($Backup) {
+        If ($BackupFile.Length -eq 0) {
+            $BackupFile = "hardeningkitty_backup_" + $Hostname + "_" + $ListName + "-$FileDate.csv"
+        } ElseIf ($(Split-Path -Path $BackupFile).Length -ne 0) {
+            If ( -Not(Test-Path -Path $(Split-Path $BackupFile))) {
+                $Message = "The path to your backup file does not exist."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Break
+            }
+        }
+    }
+    $ReportAllResults = @()
+    $BackupAllResults = @()
+
+    #
+    # Statistics
+    #
+    $StatsPassed = 0
+    $StatsLow = 0
+    $StatsMedium = 0
+    $StatsHigh = 0
+    $StatsTotal = 0
+    $Script:StatsError = 0
+
+    #
+    # Header
+    #
+    Write-Output "`n"
+    Write-Output "      =^._.^="
+    Write-Output "     _(      )/  HardeningKitty $HardeningKittyVersion"
+    Write-Output "`n"
+    Write-ProtocolEntry -Text "Starting HardeningKitty" -LogLevel "Info"
+
+    #
+    # Machine information
+    #
+    If (-not($SkipMachineInformation)) {
+
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "Getting machine information" -LogLevel "Info"
+
+        #
+        # The Get-ComputerInfo cmdlet gets a consolidated object of system
+        # and operating system properties. This cmdlet was introduced in Windows PowerShell 5.1.
+        #
+        If ($PowerShellVersion -le 5.0) {
+
+            try {
+
+                $OperatingSystem = Get-CimInstance Win32_operatingsystem
+                $ComputerSystem = Get-CimInstance Win32_ComputerSystem
+                Switch ($ComputerSystem.domainrole) {
+                    "0" { $Domainrole = "Standalone Workstation"; Break }
+                    "1" { $Domainrole = "Member Workstation"; Break }
+                    "2" { $Domainrole = "Standalone Server"; Break }
+                    "3" { $Domainrole = "Member Server"; Break }
+                    "4" { $Domainrole = "Backup Domain Controller"; Break }
+                    "5" { $Domainrole = "Primary Domain Controller"; Break }
+                }
+                $Uptime = (Get-Date) - $OperatingSystem.LastBootUpTime
+
+                $Message = "Hostname: " + $OperatingSystem.CSName
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Domain: " + $ComputerSystem.Domain
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Domain role: " + $Domainrole
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Install date: " + $OperatingSystem.InstallDate
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Last Boot Time: " + $OperatingSystem.LastBootUpTime
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Uptime: " + $Uptime
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Windows: " + $OperatingSystem.Caption
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Windows version: " + $OperatingSystem.Version
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Windows build: " + $OperatingSystem.BuildNumber
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "System-locale: " + $WinSystemLocale.Name
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+                $Message = "Powershell Version: " + $PowerShellVersion
+                Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            } catch {
+                Write-ProtocolEntry -Text "Getting machine information failed." -LogLevel "Warning"
+            }
+        } Else {
+
+            $MachineInformation = Get-ComputerInfo
+            $Message = "Hostname: " + $MachineInformation.CsDNSHostName
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Domain: " + $MachineInformation.CsDomain
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Domain role: " + $MachineInformation.CsDomainRole
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Install date: " + $MachineInformation.OsInstallDate
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Last Boot Time: " + $MachineInformation.OsLastBootUpTime
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Uptime: " + $MachineInformation.OsUptime
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Windows: " + $MachineInformation.OsName
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Windows edition: " + $MachineInformation.WindowsEditionId
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Windows version: " + $MachineInformation.WindowsVersion
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Windows build: " + $MachineInformation.WindowsBuildLabEx
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "System-locale: " + $WinSystemLocale.Name
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+            $Message = "Powershell Version: " + $PowerShellVersion
+            Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+        }
+    }
+
+    #
+    # Warning for non-english systems
+    #
+    If ($WinSystemLocale.Name -ne "en-US" -and -not($SkipLanguageWarning)) {
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "Language warning" -LogLevel "Info"
+        $Message = "HardeningKitty was developed for the system language 'en-US'. This system uses '" + $WinSystemLocale.Name + "' Language-dependent analyses can sometimes produce false results. Please create an issue if this occurs."
+        Write-ProtocolEntry -Text $Message -LogLevel "Warning"
+    }
+
+    #
+    # Intune Warning
+    #
+    If ($Source -eq "Intune") {
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "Intune warning" -LogLevel "Info"
+        $Message = "Hello friend, welcome to an adventure. Intune support is still in development and HardeningKitty has a lot of work to do to be able to query and evaluate Intune settings. Since you're already here, please help! Please maintain the finding lists and share information about Intune registry paths and values via discussions or issues. Since Intune support is still under development, do not expect a comprehensive review, the audit mode is not usable until further notice."
+        Write-ProtocolEntry -Text $Message -LogLevel "Warning"
+    }
+
+    #
+    # User information
+    #
+    If (-not($SkipUserInformation)) {
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "Getting user information" -LogLevel "Info"
+
+        $Message = "Username: " + [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+        $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+        $Message = "Is Admin: " + $IsAdmin
+        Write-ProtocolEntry -Text $Message -LogLevel "Notime"
+    } Else {
+        $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+    }
+
+    #
+    # Private working directory
+    # The auditpol backup and the secedit exports are written here.
+    #
+    $HardeningKittyTempDir = New-HardeningKittyTempDirectory
+
+    #
+    # Start Config/Audit mode
+    # The processing is done per category of the finding list.
+    # The finding list defines which module is used and the arguments and recommended values for the test.
+    #
+    If ($Mode -eq "Audit" -or $Mode -eq "Config") {
+
+        # A CSV finding list is imported. HardeningKitty has one machine and one user list.
+        If ($FileFindingList.Length -eq 0) {
+
+            $CurrentLocation = $PSScriptRoot
+            $DefaultList = "$CurrentLocation\lists\finding_list_0x6d69636b_machine.csv"
+
+            If (Test-Path -Path $DefaultList) {
+                $FileFindingList = $DefaultList
+            } Else {
+                $Message = "The finding list $DefaultList was not found."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Continue
+            }
+        }
+
+        $FindingList = Import-Csv -Path $FileFindingList -Delimiter ","
+
+        # Verify the finding list against the signed official manifest. In read modes (Audit, Config)
+        # this is informational only - nothing is applied to the system.
+        $ListStatus = Confirm-FindingListIntegrity -ListPath $FileFindingList `
+            -ManifestPath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName") `
+            -SignaturePath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName.p7s") `
+            -PinnedThumbprint $HardeningKittyListSigningThumbprint
+        If ($ListStatus.Verified) {
+            Write-ProtocolEntry -Text "Finding list verified as official (signature valid). SHA-256: $($ListStatus.Hash)" -LogLevel "Success"
+        } Else {
+            Write-ProtocolEntry -Text "Finding list is custom / unverified ($($ListStatus.Reason)). SHA-256: $($ListStatus.Hash)" -LogLevel "Warning"
+        }
+
+        If ($Filter) {
+            $FindingList = $FindingList | Where-Object -FilterScript $Filter
+            If ($FindingList.Length -eq 0) {
+                $Message = "Your filter did not return any results, please adjust the filter so that HardeningKitty has something to work with."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Break
+            }
+        }
+        $LastCategory = ""
+
+        ForEach ($Finding in $FindingList) {
+
+            #
+            # Reset
+            #
+            $Result = ""
+            $ResultDefaultValue = $false
+
+            #
+            # Category
+            #
+            If ($LastCategory -ne $Finding.Category) {
+
+                $Message = "Starting Category " + $Finding.Category
+                Write-Output "`n"
+                Write-ProtocolEntry -Text $Message -LogLevel "Info"
+                $LastCategory = $Finding.Category
+            }
+
+            #
+            # Get Registry Item
+            # Registry entries can be read with a native PowerShell function. The retrieved value is evaluated later.
+            # If the registry entry is not available, a default value is used. This must be specified in the finding list.
+            #
+            If ($Finding.Method -eq 'Registry') {
+
+                If ($Source -eq 'GPO') {
+                    If (Test-Path -Path $Finding.RegistryPath) {
+                        try {
+                            $Result = Get-ItemPropertyValue -Path $Finding.RegistryPath -Name $Finding.RegistryItem
+                            # Join the result with ";" character if result is an array
+                            if ($Result -is [system.array] -and ($Finding.RegistryItem -eq "Machine" -Or $Finding.RegistryItem -eq "EccCurves" -Or $Finding.RegistryItem -eq "NullSessionPipes" -Or $Finding.RegistryItem -eq "NullSessionShares")){
+                                $Result = $Result -join ";"
+                            }
+                        } catch {
+                            If ($Backup) {
+                                # If an error occurs and the backup mode is enabled, we consider that this policy does not exist
+                                # and put "-NODATA-" as result to identify it as non-existing policy
+                                $Result = "-NODATA-"
+                            } Else {
+                                $Result = $Finding.DefaultValue
+                                $ResultDefaultValue = $true
+                            }
+                        }
+                    } Else {
+                        If ($Backup) {
+                            # If this policy does not exist and the backup mode is enabled, we
+                            # put "-NODATA-" as result to identify it as non-existing policy
+                            $Result = "-NODATA-"
+                        } Else {
+                            $Result = $Finding.DefaultValue
+                            $ResultDefaultValue = $true
+                            # Multiline Registry Keys need a semicolon instead of a space
+                            If ($Finding.RegistryItem -eq "Machine") {
+                                $Result = $Result.Replace(";", " ")
+                            }
+                        }
+                    }
+                } ElseIf ($Source -eq 'Intune') {
+                    $Result = Get-IntuneResult
+                }
+            }
+
+            #
+            # Get secedit policy
+            # Secedit configures and analyzes system security, results are written
+            # to a file, which means HardeningKitty must create a temporary file
+            # and afterwards delete it. HardeningKitty is very orderly.
+            #
+            ElseIf ($Finding.Method -eq 'secedit') {
+
+                # Check if Secedit binary is available, skip test if not
+                If (-Not (Test-Path $BinarySecedit)) {
+                    Write-BinaryError -Binary $BinarySecedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $TempFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+                $Area = "";
+
+                Switch ($Finding.Category) {
+                    "Account Policies" { $Area = "SECURITYPOLICY"; Break }
+                    "Security Options" { $Area = "SECURITYPOLICY"; Break }
+                }
+
+                &$BinarySecedit /export /cfg $TempFileName /areas $Area | Out-Null
+
+                $Data = Get-IniContent $TempFileName
+
+                $Value = Get-HashtableValueDeep $Data $Finding.MethodArgument
+
+                if ($null -eq $Value) {
+                    $Result = $null
+                } else {
+                    $Result = $Value -as [int]
+                }
+
+                Remove-Item $TempFileName
+            }
+
+            #
+            # Get Registry List and search for item
+            # Depending on the registry structure, the value cannot be accessed directly, but must be found within a data structure
+            # If the registry entry is not available, a default value is used. This must be specified in the finding list.
+            #
+            ElseIf ($Finding.Method -eq 'RegistryList') {
+
+                If ($Source -eq 'GPO') {
+                    If (Test-Path -Path $Finding.RegistryPath) {
+
+                        try {
+                            $ResultList = Get-ItemProperty -Path $Finding.RegistryPath
+
+                            If ($ResultList | Where-Object { $_ -like "*" + $Finding.RegistryItem + "*" }) {
+                                $Result = $Finding.RegistryItem
+                            } Else {
+                                $Result = "-NODATA-"
+                            }
+
+                        } catch {
+                            $Result = $Finding.DefaultValue
+                            $ResultDefaultValue = $true
+                        }
+                    } Else {
+                        If ($Backup) {
+                            # If this policy does not exist and the backup mode is enabled, we
+                            # put "-NODATA-" as result to identify it as non-existing policy
+                            $Result = "-NODATA-"
+                        } Else {
+                            $Result = $Finding.DefaultValue
+                            $ResultDefaultValue = $true
+                        }
+                    }
+                } ElseIf ($Source -eq 'Intune') {
+                    $Result = Get-IntuneResult
+                }
+            }
+
+            #
+            # Get Audit Policy
+            # The output of auditpol.exe is parsed and will be evaluated later.
+            # The desired value is not output directly, some output lines can be ignored
+            # and are therefore skipped. If the output changes, the parsing must be adjusted :(
+            #
+            ElseIf ($Finding.Method -eq 'auditpol') {
+
+                # Check if Auditpol binary is available, skip test if not
+                If (-Not (Test-Path $BinaryAuditpol)) {
+                    Write-BinaryError -Binary $BinaryAuditpol -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $SubCategory = $Finding.MethodArgument
+
+                    # auditpol.exe does not write a backup into an existing file, so a path is
+                    # generated without creating the file
+                    $TempFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir
+                    &$BinaryAuditpol /backup /file:$TempFileName > $null
+
+                    $ResultOutputLoad = Get-Content $TempFileName
+                    foreach ($line in $ResultOutputLoad) {
+                        $table = $line.Split(",")
+                        if ($table[3] -eq $SubCategory) {
+
+                            # Translate setting value (works only for English list, so this is workaround)
+                            Switch ($table[6]) {
+                                "0" { $Result = "No Auditing"; Break }
+                                "1" { $Result = "Success"; Break }
+                                "2" { $Result = "Failure"; Break }
+                                "3" { $Result = "Success and Failure"; Break }
+                            }
+                        }
+                    }
+
+                    # House cleaning
+                    Remove-Item $TempFileName
+                    Clear-Variable -Name ("ResultOutputLoad", "table")
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Get Account Policy
+            # The output of net.exe is parsed and will be evaluated later.
+            # It may be necessary to use the /domain parameter when calling net.exe.
+            # The values of the user executing the script are read out. These may not match the password policy.
+            #
+            ElseIf ($Finding.Method -eq 'accountpolicy') {
+
+                If ($Source -eq 'Intune') {
+                    $Result = Get-IntuneResult
+                }
+
+                If ($Source -eq 'GPO' -or $Result -eq 'NotSupported') {
+
+                    # Check if net binary is available, skip test if not
+                    If (-Not (Test-Path $BinaryNet)) {
+                        Write-BinaryError -Binary $BinaryNet -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                        Continue
+                    }
+
+                    try {
+
+                        $ResultOutput = &$BinaryNet accounts
+
+                        # "Parse" account policy
+                        Switch ($Finding.Name) {
+                            "Force user logoff how long after time expires" { $ResultOutput[0] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Network security: Force logoff when logon hours expires" { $ResultOutput[0] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Minimum password age" { $ResultOutput[1] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Maximum password age" { $ResultOutput[2] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Minimum password length" { $ResultOutput[3] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Length of password history maintained" { $ResultOutput[4] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Account lockout threshold" { $ResultOutput[5] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Account lockout duration" { $ResultOutput[6] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                            "Reset account lockout counter" { $ResultOutput[7] -match '([a-zA-Z:, /-]+)  ([a-z0-9, ]+)' | Out-Null; $Result = $Matches[2]; Break }
+                        }
+
+                    } catch {
+                        $Result = $Finding.DefaultValue
+                        $ResultDefaultValue = $true
+                    }
+                }
+            }
+            #
+            # Get Local Account Information
+            # The PowerShell function Get-LocalUser is used for this.
+            # In order to get the correct user, the query is made via the SID,
+            # the base value of the computer must first be retrieved.
+            #
+            ElseIf ($Finding.Method -eq 'localaccount') {
+
+                try {
+
+                    # Get Computer SID
+                    $ComputerSid = ((Get-LocalUser | Select-Object -First 1).SID).AccountDomainSID.ToString()
+
+                    # Get User Status
+                    $Sid = $ComputerSid + "-" + $Finding.MethodArgument
+                    $ResultOutput = Get-LocalUser -SID $Sid
+
+                    If ($Finding.Name.Contains("account status")) {
+                        $Result = $ResultOutput.Enabled
+                    } ElseIf ($Finding.Name.Contains("Rename")) {
+                        $Result = $ResultOutput.Name
+                    } Else {
+                        $Result = $Finding.DefaultValue
+                        $ResultDefaultValue = $true
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # User Rights Assignment
+            # This method was first developed with the tool accessck.exe, hence the name.
+            # Due to compatibility problems in languages other than English, secedit.exe is
+            # now used to read the User Rights Assignments.
+            #
+            # Secedit configures and analyzes system security, results are written
+            # to a file, which means HardeningKitty must create a temporary file
+            # and afterwards delete it. HardeningKitty is very orderly.
+            #
+            ElseIf ($Finding.Method -eq 'accesschk') {
+
+                # Check if Secedit binary is available, skip test if not
+                If (-Not (Test-Path $BinarySecedit)) {
+                    Write-BinaryError -Binary $BinarySecedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $Area = "USER_RIGHTS"
+                $TempFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+
+                try {
+
+                    &$BinarySecedit /export /cfg $TempFileName /areas $Area | Out-Null
+                    # -SimpleMatch: MethodArgument comes from the finding list and must be treated
+                    # as literal text, not a regular expression
+                    $ResultOutputRaw = Get-Content -Encoding unicode $TempFileName | Select-String -SimpleMatch $Finding.MethodArgument
+
+                    If ($null -eq $ResultOutputRaw) {
+                        $Result = ""
+                    } Else {
+                        $ResultOutputList = $ResultOutputRaw.ToString().split("=").Trim()
+                        $Result = $ResultOutputList[1] -Replace "\*", ""
+                        $Result = $Result -Replace ",", ";"
+                    }
+
+                } catch {
+                    # If secedit did not work, throw an error instead of using the DefaultValue
+                    $Script:StatsError++
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", secedit.exe could not read the configuration. Test skipped."
+                    Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                    Continue
+                }
+
+                Remove-Item $TempFileName
+            }
+
+            #
+            # Windows Optional Feature
+            # Yay, a native PowerShell function! The status of the feature can easily be read out directly.
+            #
+            ElseIf ($Finding.Method -eq 'WindowsOptionalFeature') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $ResultOutput = Get-WindowsOptionalFeature -Online -FeatureName $Finding.MethodArgument
+                    $Result = $ResultOutput.State
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Get CimInstance and search for item
+            # Via a CIM instance classes can be read from the CIM server.
+            # Afterwards, you have to search for the correct property within the class.
+            #
+            ElseIf ($Finding.Method -eq 'CimInstance') {
+
+                try {
+
+                    $ResultList = Get-CimInstance -ClassName $Finding.ClassName -Namespace $Finding.Namespace
+                    $Property = $Finding.Property
+
+                    If ($ResultList.$Property | Where-Object { $_ -like "*" + $Finding.RecommendedValue + "*" }) {
+                        $Result = $Finding.RecommendedValue
+                    } Else {
+                        $Result = "Not available"
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # BitLocker Drive Encryption
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            ElseIf ($Finding.Method -eq 'BitLockerVolume') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $ResultOutput = Get-BitLockerVolume -MountPoint $Env:SystemDrive
+                    If ($ResultOutput.VolumeType -eq 'OperatingSystem') {
+                        $ResultArgument = $Finding.MethodArgument
+                        $Result = $ResultOutput.$ResultArgument
+                    } Else {
+                        $Result = "Manual check required"
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # PowerShell Language Mode
+            # This is a single purpose function, the desired configuration is output directly.
+            #
+            ElseIf ($Finding.Method -eq 'LanguageMode') {
+
+                try {
+
+                    $ResultOutput = $ExecutionContext.SessionState.LanguageMode
+                    $Result = $ResultOutput
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Microsoft Defender Status
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            ElseIf ($Finding.Method -eq 'MpComputerStatus') {
+
+                try {
+
+                    $ResultOutput = Get-MpComputerStatus
+                    $ResultArgument = $Finding.MethodArgument
+                    $Result = $ResultOutput.$ResultArgument
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Microsoft Defender Preferences
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            ElseIf ($Finding.Method -eq 'MpPreference') {
+
+                try {
+
+                    $ResultOutput = Get-MpPreference
+                    $ResultArgument = $Finding.MethodArgument
+                    $Result = $ResultOutput.$ResultArgument
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Microsoft Defender Preferences - Attack surface reduction rules (ASR rules)
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            ElseIf ($Finding.Method -eq 'MpPreferenceAsr') {
+
+                try {
+
+                    $ResultOutput = Get-MpPreference
+                    $ResultAsrIds = $ResultOutput.AttackSurfaceReductionRules_Ids
+                    $ResultAsrActions = $ResultOutput.AttackSurfaceReductionRules_Actions
+                    $Result = $Finding.DefaultValue
+                    $Counter = 0
+
+                    ForEach ($AsrRule in $ResultAsrIds) {
+
+                        If ($AsrRule -eq $Finding.MethodArgument) {
+                            $Result = $ResultAsrActions[$Counter]
+                            Continue
+                        }
+                        $Counter++
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Microsoft Defender Preferences - Exclusion lists
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            ElseIf ($Finding.Method -eq 'MpPreferenceExclusion') {
+
+                # Check if the user has admin rights, skip test if not
+                # Normal users are not allowed to get exclusions
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $ResultOutput = Get-MpPreference
+                    $ExclusionType = $Finding.MethodArgument
+                    $ResultExclusions = $ResultOutput.$ExclusionType
+
+                    ForEach ($Exclusion in $ResultExclusions) {
+                        $Result += $Exclusion + ";"
+                    }
+                    # Remove last character
+                    $Result = $Result -replace ".$"
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Exploit protection (System)
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            # Since the object has several dimensions and there is only one dimension
+            # in the finding list (lazy) a workaround with split must be done...
+            #
+            ElseIf ($Finding.Method -eq 'Processmitigation') {
+
+                try {
+
+                    $ResultOutput = Get-ProcessMitigation -System
+                    $ResultArgumentArray = $Finding.MethodArgument.Split(".")
+                    $ResultArgument0 = $ResultArgumentArray[0]
+                    $ResultArgument1 = $ResultArgumentArray[1]
+                    $Result = $ResultOutput.$ResultArgument0.$ResultArgument1
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Exploit protection (Application)
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            # Since the object has several dimensions and there is only one dimension
+            # in the finding list (lazy) a workaround with split must be done...
+            #
+            ElseIf ($Finding.Method -eq 'ProcessmitigationApplication') {
+
+                try {
+
+                    $ResultArgumentArray = $Finding.MethodArgument.Split("/")
+                    $ResultOutput = Get-ProcessMitigation -Name $ResultArgumentArray[0]
+                    $ResultArgument0 = $ResultArgumentArray[1]
+                    $ResultArgument1 = $ResultArgumentArray[2]
+                    $Result = $ResultOutput.$ResultArgument0.$ResultArgument1
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # bcdedit
+            # Again, the output of a tool must be searched and parsed. Ugly...
+            #
+            ElseIf ($Finding.Method -eq 'bcdedit') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if Bcdedit binary is available, skip test if not
+                If (-Not (Test-Path $BinaryBcdedit)) {
+                    Write-BinaryError -Binary $BinaryBcdedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $ResultOutput = &$BinaryBcdedit
+                    $ResultOutput = $ResultOutput | Where-Object { $_ -like "*" + $Finding.RecommendedValue + "*" }
+
+                    If ($ResultOutput -match ' ([a-z,A-Z]+)') {
+                        $Result = $Matches[1]
+                    } Else {
+                        $Result = $Finding.DefaultValue
+                        $ResultDefaultValue = $true
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # FirewallRule
+            # Search for a specific firewall rule with a given name
+            #
+            ElseIf ($Finding.Method -eq 'FirewallRule') {
+
+                try {
+
+                    $ResultOutput = Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $Finding.Name 2> $null
+                    $Result = $ResultOutput.Enabled
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Service
+            # Check the status of a service
+            #
+            ElseIf ($Finding.Method -eq 'service') {
+
+                try {
+
+                    $ResultOutput = Get-Service -Name $Finding.MethodArgument 2> $null
+                    
+                    # Use only processes, not drivers
+                    # https://learn.microsoft.com/en-us/dotnet/api/system.serviceprocess.servicetype
+                    If ($ResultOutput.ServiceType.value__ -ge 16) {
+                        $Result = $ResultOutput.StartType
+                    } Else {
+                        $Result = $Finding.DefaultValue
+                        $ResultDefaultValue = $true
+                    }
+                    
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Scheduled Task
+            # Check the status of a scheduled task
+            #
+            ElseIf ($Finding.Method -eq 'ScheduledTask') {
+
+                try {
+
+                    $ResultOutput = Get-ScheduledTask -TaskName $Finding.MethodArgument 2> $null
+                    $Result = $ResultOutput.State
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+            }
+
+            #
+            # Compare result value and recommendation
+            # The finding list specifies the test, as well as the recommended values.
+            # There are two output formats, one for command line output and one for the CSV file.
+            #
+            If ($Mode -eq "Audit") {
+
+                #
+                # User Right Assignment
+                # For multilingual support, a SID translation takes place and then the known SID values are compared with each other.
+                # The results are already available as SID (from secedit) and therefore the specifications are now also translated and still sorted.
+                #
+                If ($Finding.Method -eq 'accesschk') {
+
+                    $SaveRecommendedValue = $Finding.RecommendedValue
+
+                    If ($Result -ne '') {
+
+                        $ListRecommended = $Finding.RecommendedValue.Split(";")
+                        $ListRecommendedSid = @()
+
+                        # SID Translation
+                        ForEach ($AccountName in $ListRecommended) {
+                            $AccountSid = Translate-SidFromWellkownAccount -AccountName $AccountName
+                            $ListRecommendedSid += $AccountSid
+                        }
+                        # Sort SID List
+                        $ListRecommendedSid = $ListRecommendedSid | Sort-Object
+
+                        # Build String
+                        ForEach ($AccountName in $ListRecommendedSid) {
+                            [String] $RecommendedValueSid += $AccountName + ";"
+                        }
+
+                        $RecommendedValueSid = $RecommendedValueSid -replace ".$"
+                        $Finding.RecommendedValue = $RecommendedValueSid
+                        Clear-Variable -Name ("RecommendedValueSid")
+                    }
+                }
+
+                #
+                # Exception handling for special registry keys
+                # Machine => Network access: Remotely accessible registry paths
+                # Hardened UNC Paths => Remove spaces in result and recommendation only if result is not null or empty
+                #
+                If ($Source -eq "GPO") {
+                    If ($Finding.Method -eq 'Registry' -and $Finding.RegistryItem -eq "Machine") {
+                        # $Finding.RecommendedValue = $Finding.RecommendedValue.Replace(";", " ")
+                    } ElseIf ($Finding.Method -eq 'Registry' -and $Finding.RegistryPath -eq "HKLM:\Software\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths") {
+                        If (![string]::IsNullOrEmpty($Result)) {
+                            $Result = $Result.Replace(" ", "")
+                        }
+                        $Finding.RecommendedValue = $Finding.RecommendedValue.Replace(" ", "")
+                    }
+                }
+
+                #
+                # Handling for registry keys with an "advanced" format
+                #
+
+                # Define list of registry items
+                $RegistryItemCollection = @("ConfigureRpcConnectionPolicy", "ConfigureRpcListenerPolicy", "CSE_Registry", "CSE_Security", "PointAndPrintRestrictions",
+                "SpecifyMaximumFileSizeApplicationLog", "SpecifyMaximumFileSizeSecurityLog", "SpecifyMaximumFileSizeSystemLog", "Channel_LogMaxSize_3" )
+
+                # Go through all the special cases that require additional handling
+                If ($Source -eq "Intune" -and $Finding.Method -eq 'Registry' -and $Finding.RegistryItemIntune -eq "AttackSurfaceReductionRules") {
+                    #
+                    # ASR rules
+                    #
+                    If ($Finding.RegistryItem -eq "ExploitGuard_ASR_Rules") {
+                        # There is no Intune setting for generally enabled ASR rules, if something is configured, HardeningKitty assumes it is in use
+                        If ($Result.Length -gt 0) {
+                            $Result = 1
+                        }
+                    } Else {
+                        # Going through ASR rules
+                        try {
+                            $ResultAsr = $Result.Split("|")
+                            ForEach ($AsrRow in $ResultAsr) {
+                                $AsrRule = $AsrRow.Split("=")
+                                If ($AsrRule[0] -eq $Finding.RegistryItem) {
+                                    $Result = $AsrRule[1]
+                                    Break
+                                } Else {
+                                    $Result = $Finding.DefaultValue
+                                    $ResultDefaultValue = $true
+                                }
+                            }
+                        } catch {
+                            $Result = $Finding.DefaultValue
+                            $ResultDefaultValue = $true
+                        }
+                    }
+                } ElseIf ($Source -eq "Intune" -and $Finding.Method -eq 'Registry' -and $Finding.RegistryItemIntune -eq "HardenedUNCPaths") {
+                    #
+                    # Hardened UNC path
+                    # Intune uses &#xF000; as a delimiter to configure multiple paths
+                    # All UNC paths are in the value parameter of the "Pol_HardenedPaths" data id
+                    #
+                    $Delimiter = [char]::ConvertFromUtf32(0xF000)
+                    If ($Result.contains($Delimiter)) {
+                        $PreviousValue = ""
+                        try {
+                            # Finding list contains path and the recommend configuration
+                            $RecommendedValue = $Finding.RecommendedValueIntune.Split(";")
+                            # Convert raw Intune value into XML, and separate the components
+                            $XmlString = "<root>$Result</root>"
+                            $XmlObject = [xml]$XmlString
+                            $UncPaths = $XmlObject.root.data.value.Split($Delimiter)
+                            # The path configuration is in the element before the path in the array
+                            ForEach ($UncPath in $UncPaths) {
+                                If ($UncPath -eq $RecommendedValue[0]) {
+                                    $Result = $RecommendedValue[0]+";"+$PreviousValue
+                                    Break
+                                }
+                                $PreviousValue = $UncPath
+                            }
+                        } catch {
+                            # If something goes wrong or Intune output is unexpected
+                            $Result = "NotConfigured"
+                        }
+                    }
+                } ElseIf ($Source -eq "Intune" -and $Finding.RegistryItemIntune -eq "PreventInstallationOfMatchingDeviceSetupClasses") {
+                    #
+                    # Prevent installation of devices using drivers that match an device setup class
+                    #
+                    try {
+                        # Finding list contains id and the recommend configuration
+                        $RecommendedValue = $Finding.RecommendedValueIntune.Split(";")
+
+                        # Check if setting is enabled
+                        If ($RecommendedValue[0] -eq "PreventInstallationOfMatchingDeviceSetupClasses") {
+                            If ($Result.StartsWith("<enabled")) {
+                                $Result = $RecommendedValue[0]+";<enabled />"
+                            } Else {
+                                $Result = $RecommendedValue[0]+";<disabled />"
+                            }
+                        # Go through additional configuration
+                        } Else {
+                            # Convert raw Intune value to XML
+                            $XmlString = "<root>$Result</root>"
+                            $XmlObject = [xml]$XmlString
+
+                            ForEach ($row in $XmlObject.root) {
+                                # Check if retroactive mode is active
+                                If ($RecommendedValue[0] -eq "DeviceInstall_Classes_Deny_Retroactive") {
+                                    If ($row.data.id -eq $RecommendedValue[0]) {
+                                        If ($row.data.value -eq $RecommendedValue[1]) {
+                                            $Result = $RecommendedValue[0]+";true"
+                                            Break
+                                        }
+                                    }
+                                # Check list of device classes
+                                } ElseIf ($RecommendedValue[0] -eq "DeviceInstall_Classes_Deny_List") {
+                                    If ($row.data.id -eq $RecommendedValue[0]) {
+                                        # Intune uses &#xF000; as a delimiter to configure multiple classes
+                                        $Delimiter = [char]::ConvertFromUtf32(0xF000)
+                                        $DenyList = $row.data.value.Split($Delimiter)
+                                        # Go through list of device classes
+                                        ForEach ($entry in $DenyList) {
+                                            If ($entry -eq $RecommendedValue[1]) {
+                                                $Result = $RecommendedValue[0]+";"+$entry
+                                                Break
+                                            } Else {
+                                                $Result = $RecommendedValue[0]+";{NotFound}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        # If something goes wrong or Intune output is unexpected
+                        $Result = "NotConfigured"
+                    }
+                } ElseIf ($Source -eq "Intune" -and $Finding.Method -eq 'Registry' -and $Finding.RegistryItemIntune -in $RegistryItemCollection) {
+                    #
+                    # Parse the Intune settings in "XML" format to retrieve a specific item/configuration
+                    #
+                    try {
+                        $XmlString = "<root>$Result</root>"
+                        $XmlObject = [xml]$XmlString
+                        ForEach ($row in $XmlObject.root.data) {
+                            If ([string]$row.id.Equals($Finding.MethodArgument)) {
+                                $Result = $row.value
+                                Break
+                            }
+                        }
+                    } catch {
+                        # If something goes wrong or Intune output is unexpected
+                        $Result = "NotConfigured"
+                    }
+                }
+
+                #
+                # Compare the result with the recommendation
+                #
+                $ResultPassed = $false
+                If ($Source -eq "Intune" -and ($Finding.Method -eq "Registry" -or $Finding.Method -eq "RegistryList")) {
+                    Switch ($Finding.OperatorIntune) {
+                        "="  { If ([string] $Result -eq $Finding.RecommendedValueIntune) { $ResultPassed = $true }; Break }
+                        "<=" { try { If ([int]$Result -le [int]$Finding.RecommendedValueIntune) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        "<=!0" { try { If ([int]$Result -le [int]$Finding.RecommendedValueIntune -and [int]$Result -ne 0) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        ">=" { try { If ([int]$Result -ge [int]$Finding.RecommendedValueIntune) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        "contains" { If ($Result.ToString().Contains($Finding.RecommendedValueIntune)) { $ResultPassed = $true }; Break }
+                        "notcontains" { If (-not($Result.ToString().Contains($Finding.RecommendedValueIntune))) { $ResultPassed = $true }; Break }
+                        "!="  { If ([string] $Result -ne $Finding.RecommendedValueIntune) { $ResultPassed = $true }; Break }
+                        "=|0" { try { If ([string]$Result -eq $Finding.RecommendedValueIntune -or $Result.Length -eq 0) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                    }
+                } Else {
+                    Switch ($Finding.Operator) {
+                        "="  { If ([string] $Result -eq $Finding.RecommendedValue) { $ResultPassed = $true }; Break }
+                        "<=" { try { If ([int]$Result -le [int]$Finding.RecommendedValue) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        "<=!0" { try { If ([int]$Result -le [int]$Finding.RecommendedValue -and [int]$Result -ne 0) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        ">=" { try { If ([int]$Result -ge [int]$Finding.RecommendedValue) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                        "contains" { If ($Result.ToString().Contains($Finding.RecommendedValue)) { $ResultPassed = $true }; Break }
+                        "notcontains" { If (-not($Result.ToString().Contains($Finding.RecommendedValue))) { $ResultPassed = $true }; Break }
+                        "!="  { If ([string] $Result -ne $Finding.RecommendedValue) { $ResultPassed = $true }; Break }
+                        "=|0" { try { If ([string]$Result -eq $Finding.RecommendedValue -or $Result.Length -eq 0) { $ResultPassed = $true } } catch { $ResultPassed = $false }; Break }
+                    }
+                }
+
+                #
+                # Restore Result after SID translation
+                # The results are already available as SID, for better readability they are translated into their names
+                #
+                If ($Finding.Method -eq 'accesschk') {
+
+                    If ($Result -ne "") {
+
+                        $ListResult = $Result.Split(";")
+                        ForEach ($AccountSid in $ListResult) {
+                            $AccountName = Get-AccountFromSid -AccountSid $AccountSid
+                            [String] $ResultName += $AccountName.Trim() + ";"
+                        }
+                        $ResultName = $ResultName -replace ".$"
+                        $Result = $ResultName
+                        Clear-Variable -Name ("ResultName")
+                    }
+
+                    $Finding.RecommendedValue = $SaveRecommendedValue
+                }
+
+                If ($ResultPassed) {
+                    # Passed
+                    $TestResult = "Passed"
+                    If ($Source -eq "Intune" -and ($Finding.Method -eq "Registry" -or $Finding.Method -eq "RegistryList")) {
+                        $MessageRecommendedValue = $Finding.RecommendedValueIntune
+                    } Else {
+                        $MessageRecommendedValue = $Finding.RecommendedValue
+                    }
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", Result=$Result, Recommended=" + $MessageRecommendedValue + ", Severity=Passed"
+                    Write-ResultEntry -Text $Message -SeverityLevel "Passed"
+
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = "Passed"
+                            Result = $Result
+                            Recommended = $MessageRecommendedValue
+                            TestResult = $TestResult
+                            SeverityFinding = $Finding.Severity
+                            DefaultValue = $ResultDefaultValue
+                            Filter = $Finding.Filter
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+
+                    # Increment Counter
+                    $StatsPassed++
+
+                } Else {
+                    # Failed
+                    $TestResult = "Failed"
+                    If ($Source -eq "Intune" -and $Finding.Method -eq "Registry") {
+                        $MessageRecommendedValue = $Finding.RecommendedValueIntune
+                        $FindingOperator = $Finding.OperatorIntune
+                    } Else {
+                        $MessageRecommendedValue = $Finding.RecommendedValue
+                        $FindingOperator = $Finding.Operator
+                    }
+                    If ($FindingOperator -eq "!=") {
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", Result=$Result, Recommended=Not " + $MessageRecommendedValue + ", Severity=" + $Finding.Severity
+                    } Else {
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", Result=$Result, Recommended=" + $MessageRecommendedValue + ", Severity=" + $Finding.Severity
+                    }
+
+                    Write-ResultEntry -Text $Message -SeverityLevel $Finding.Severity
+
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $Finding.Severity
+                            Result = $Result
+                            Recommended = $MessageRecommendedValue
+                            TestResult = $TestResult
+                            SeverityFinding = $Finding.Severity
+                            DefaultValue = $ResultDefaultValue
+                            Filter = $Finding.Filter
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+
+                    # Increment Counter
+                    Switch ($Finding.Severity) {
+
+                        "Low"    { $StatsLow++; Break }
+                        "Medium" { $StatsMedium++; Break }
+                        "High"   { $StatsHigh++; Break }
+                    }
+                }
+
+            #
+            # Only return received value
+            #
+            } Elseif ($Mode -eq "Config") {
+
+                $Message = "ID " + $Finding.ID + "; " + $Finding.Name + "; Result=$Result"
+                Write-ResultEntry -Text $Message
+
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = ""
+                        Result = $Result
+                        Recommended = ""
+                        TestResult = ""
+                        SeverityFinding = ""
+                        DefaultValue = $ResultDefaultValue
+                        Filter = $Finding.Filter
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+                If ($Backup) {
+
+                    # Do not save Firewall rules in the backup file, if they are not set
+                    If ( $Finding.Method -eq "FirewallRule" -and !$Result ) {
+                        Continue
+                    }
+
+                    $BackupResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Method = $Finding.Method
+                        MethodArgument = $Finding.MethodArgument
+                        RegistryPath = $Finding.RegistryPath
+                        RegistryItem = $Finding.RegistryItem
+                        ClassName =$Finding.ClassName
+                        Namespace = $Finding.Namespace
+                        Property = $Finding.Property
+                        DefaultValue = $Finding.DefaultValue
+                        RecommendedValue = $Result
+                        Operator = $Finding.Operator
+                        Severity = $Finding.Severity
+                    }
+                    $BackupAllResults += $BackupResult
+                }
+            }
+        }
+    }
+
+    #
+    # Start HailMary mode
+    # HardeningKitty configures all settings in a finding list file.
+    # Even though HardeningKitty works very carefully, please only
+    # use HailyMary if you know what you are doing.
+    #
+    Elseif ($Mode -eq "HailMary") {
+
+        # A CSV finding list is imported
+        If ($FileFindingList.Length -eq 0) {
+
+            # No fallback to a default list anymore, just show an error message
+            # $CurrentLocation = $PSScriptRoot
+            # $DefaultList = "$CurrentLocation\lists\finding_list_0x6d69636b_machine.csv"
+            $Message = "No finding list has been specified - I'm sorry Dave, I'm afraid I can't do that. Please select a suitable list and specify it with the FileFindingList parameter. Select the finding list wisely and check beforehand whether the settings can affect the stability or the function of your system."
+            Write-ProtocolEntry -Text $Message -LogLevel "Error"
+            Continue
+
+            If (Test-Path -Path $DefaultList) {
+                $FileFindingList = $DefaultList
+            } Else {
+                $Message = "The finding list $DefaultList was not found."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Continue
+            }
+        }
+
+        $FindingList = Import-Csv -Path $FileFindingList -Delimiter ","
+
+        # Verify the finding list against the signed official manifest before applying anything.
+        # HailMary is a write mode: refuse an unverified (custom / modified) list unless the operator
+        # explicitly accepts the risk with -AllowCustomList.
+        $ListStatus = Confirm-FindingListIntegrity -ListPath $FileFindingList `
+            -ManifestPath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName") `
+            -SignaturePath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName.p7s") `
+            -PinnedThumbprint $HardeningKittyListSigningThumbprint
+        If ($ListStatus.Verified) {
+            Write-ProtocolEntry -Text "Finding list verified as official (signature valid). SHA-256: $($ListStatus.Hash)" -LogLevel "Success"
+        } ElseIf ($AllowCustomList) {
+            Write-ProtocolEntry -Text "Applying an UNVERIFIED finding list at your own risk ($($ListStatus.Reason)). SHA-256: $($ListStatus.Hash)" -LogLevel "Warning"
+        } Else {
+            Write-ProtocolEntry -Text "Refusing to apply an unverified finding list in $Mode mode ($($ListStatus.Reason)). SHA-256: $($ListStatus.Hash). Re-run with -AllowCustomList to apply it at your own risk." -LogLevel "Error"
+            Break
+        }
+
+        $LastCategory = ""
+        $ProcessmitigationEnableArray = @()
+        $ProcessmitigationDisableArray = @()
+
+        #
+        # Create a System Restore Point
+        #
+
+        If (-not($SkipRestorePoint)) {
+
+            $Message = "Creating a system restore point"
+            Write-Output "`n"
+            Write-ProtocolEntry -Text $Message -LogLevel "Info"
+
+            # Check if the user has admin rights, skip test if not
+            If (-not($IsAdmin)) {
+                Write-NotAdminError -FindingID "42" -FindingName "System Restore Point" -FindingMethod "Checkpoint-Computer"
+                Continue
+            }
+
+            If ($PSVersionTable.PSVersion.Major -gt 5) {
+                $Message = "The cmdlet used to create a system restore has been removed from PowerShell in version 6 onwards. To create a system restore, run HardeninKitty with PowerShell version 5. Alternatively, create a system restore point manually and use the -SkipRestorePoint parameter to run HailMary anyway. Be careful!"
+                Write-ResultEntry -Text $Message -SeverityLevel "High"
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                Break
+            }
+
+            Try {
+                Enable-ComputerRestore -Drive $Env:SystemDrive
+                Checkpoint-Computer -Description 'HardeningKitty' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop -WarningAction Stop
+            } catch {
+
+                $Message = "Creating a system restore point failed. Use -SkipRestorePoint to run HailMary anyway. Be careful!"
+                Write-ResultEntry -Text $Message -SeverityLevel "High"
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                Break
+            }
+
+            $Message = "Creating a system restore point was successful"
+            Write-ResultEntry -Text $Message -SeverityLevel "Passed"
+            If ($Log) {
+                Add-MessageToFile -Text $Message -File $LogFile
+            }
+        }
+
+        ForEach ($Finding in $FindingList) {
+
+            #
+            # Category
+            #
+            If ($LastCategory -ne $Finding.Category) {
+
+                $Message = "Starting Category " + $Finding.Category
+                Write-Output "`n"
+                Write-ProtocolEntry -Text $Message -LogLevel "Info"
+                $LastCategory = $Finding.Category
+            }
+
+            #
+            # Registry
+            # Create or modify a registry value.
+            #
+            If ($Finding.Method -eq 'Registry' -or $Finding.Method -eq 'RegistryList') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin) -and -not($Finding.RegistryPath.StartsWith("HKCU:\"))) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                #
+                # Do not set/configure certain registry
+                # ASR rules configured with Intune (ASRRules, ASROnlyExclusions)
+                # Defender expections configured with Intune (ExcludedExtensions, ExcludedPaths, ExcludedProcesses)
+                #
+                If ($Finding.RegistryItem -eq "ASRRules" -Or $Finding.RegistryItem -eq "ASROnlyExclusions" -Or $Finding.RegistryItem -eq "ExcludedExtensions" -Or $Finding.RegistryItem -eq "ExcludedPaths" -Or $Finding.RegistryItem -eq "ExcludedProcesses") {
+                    $ResultText = "This setting is not configured by HardeningKitty"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Continue
+                }
+
+                $RegType = "String"
+
+                #
+                # Basically this is true, but there is an exception for the finding "MitigationOptions_FontBocking",
+                # the value "10000000000" is written to the registry as a string...
+                #
+                # ... and more exceptions are added over time:
+                #
+                # MitigationOptions_FontBocking => Mitigation Options: Untrusted Font Blocking
+                # Machine => Network access: Remotely accessible registry paths
+                # Retention => Event Log Service: *: Control Event Log behavior when the log file reaches its maximum size
+                # AllocateDASD => Devices: Allowed to format and eject removable media
+                # ScRemoveOption => Interactive logon: Smart card removal behavior
+                # AutoAdminLogon => MSS: (AutoAdminLogon) Enable Automatic Logon (not recommended)
+                #
+                If ($Finding.RegistryItem -eq "MitigationOptions_FontBocking" -Or $Finding.RegistryItem -eq "Retention" -Or $Finding.RegistryItem -eq "AllocateDASD" -Or $Finding.RegistryItem -eq "ScRemoveOption" -Or $Finding.RegistryItem -eq "AutoAdminLogon") {
+                    $RegType = "String"
+                } ElseIf ($Finding.RegistryItem -eq "Machine" -Or $Finding.RegistryItem -eq "EccCurves" -Or $Finding.RegistryItem -eq "NullSessionPipes" -Or $Finding.RegistryItem -eq "NullSessionShares") {
+                    $RegType = "MultiString"
+                    $Finding.RecommendedValue = $Finding.RecommendedValue -split ";"
+                } ElseIf ($Finding.RecommendedValue -match "^\d+$") {
+                    $RegType = "DWord"
+                }
+
+                If (!(Test-Path $Finding.RegistryPath)) {
+
+                    $Result = New-Item $Finding.RegistryPath -Force;
+
+                    If ($Result) {
+                        $ResultText = "Registry key created"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+                        Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                        If ($Log) {
+                            Add-MessageToFile -Text $Message -File $LogFile
+                        }
+                        If ($Report) {
+                            $ReportResult = [ordered] @{
+                                ID = $Finding.ID
+                                Category = $Finding.Category
+                                Name = $Finding.Name
+                                Severity = $MessageSeverity
+                                Result = $ResultText
+                                Recommended = ""
+                                TestResult = $TestResult
+                                SeverityFinding = ""
+                            }
+                            $ReportAllResults += $ReportResult
+                        }
+                    } Else {
+                        $ResultText = "Failed to create registry key"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                        Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                        If ($Log) {
+                            Add-MessageToFile -Text $Message -File $LogFile
+                        }
+                        If ($Report) {
+                            $ReportResult = [ordered] @{
+                                ID = $Finding.ID
+                                Category = $Finding.Category
+                                Name = $Finding.Name
+                                Severity = $MessageSeverity
+                                Result = $ResultText
+                                Recommended = ""
+                                TestResult = $TestResult
+                                SeverityFinding = ""
+                            }
+                            $ReportAllResults += $ReportResult
+                        }
+                        Continue
+                    }
+                }
+
+                #
+                # The method RegistryList needs a separate handling, because the name of the registry key is dynamic, usually incremented.
+                # Therefore, it is searched whether the value already exists or not. If the value does not exist, it counts how many
+                # other values are already there in order to set the next higher value and not overwrite existing keys.
+                #
+                If ($Finding.Method -eq 'RegistryList') {
+                    $RegistryItemFound = $false
+                    $ListPolicies = $Finding.RegistryPath
+                    $ResultList = Get-ItemProperty -Path $Finding.RegistryPath
+                    $ResultListCounter = 0
+                    If ($ResultList | Where-Object { $_ -like "*" + $Finding.RegistryItem + "*" }) {
+                        $ResultList.PSObject.Properties | ForEach-Object {
+                            If ($_.Value -eq $Finding.RegistryItem) {
+                                $Finding.RegistryItem = $_.Name
+                                $RegistryItemFound = $true
+                            }
+                        }
+                    } Else {
+                        $ResultList.PSObject.Properties | ForEach-Object {
+                            $ResultListCounter++
+                        }
+                    }
+                    # Check if registryItem (key name) has been found or not
+                    If ($RegistryItemFound -eq $false) {
+                        If ($ResultListCounter -eq 0) {
+                            $Finding.RegistryItem = 1
+                        } Else {
+                            # Check if key is already used and can be used
+                            $KeyAlreadyExists = $true
+                            $Finding.RegistryItem = 1
+                            while ($KeyAlreadyExists){
+                                try {
+                                    # This key exists and should be incremented
+                                    $Result = Get-ItemPropertyValue -Path $Finding.RegistryPath -Name $Finding.RegistryItem
+                                    $Finding.RegistryItem=$Finding.RegistryItem+1
+                                    $KeyAlreadyExists = $true;
+                                } catch {
+                                    # This key does not exist and it can be used
+                                    $KeyAlreadyExists = $false;
+                                }
+                            }
+                        }
+                    }
+                }
+                $ResultText = ""
+                # Remove this policy if it should not exists
+                If ($Finding.RecommendedValue -eq '-NODATA-') {
+
+                    # Check if the key (item) already exists
+                    $keyExists = $true;
+                    try {
+                        # This key exists
+                        $Result = Get-ItemPropertyValue -Path $Finding.RegistryPath -Name $Finding.RegistryItem
+                    } catch {
+                        # This key does not exist
+                        $keyExists = $false;
+                    }
+
+                    If ($keyExists) {
+                        # key exists
+                        try {
+                            Remove-ItemProperty -Path $Finding.RegistryPath -Name $Finding.RegistryItem
+                            $ResultText = "Registry key removed"
+                            $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                            $MessageSeverity = "Passed"
+                            $TestResult = "Passed"
+                        } catch {
+                            $ResultText = "Failed to remove registry key"
+                            $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                            $MessageSeverity = "High"
+                            $TestResult = "Failed"
+                        }
+                    } Else {
+                        # key does not exists
+
+                        If ($Finding.Method -eq 'RegistryList') {
+                            # Don't show incorrect item
+                            $ResultText = "This value does not already exists in list policy"
+                            $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $ResultText
+                        } Else {
+                            $ResultText = "This key policy does not already exists"
+                            $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                        }
+                        $MessageSeverity = "Low"
+                        $TestResult = "Passed"
+                    }
+
+
+                } Else {
+                    $Result = Set-ItemProperty -PassThru -Path $Finding.RegistryPath -Name $Finding.RegistryItem -Type $RegType -Value $Finding.RecommendedValue
+
+                    if ($Result) {
+                        $ResultText = "Registry value created/modified"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+                    } else {
+                        $ResultText = "Failed to create registry value"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                    }
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # secedit
+            # Set a security policy
+            #
+            If ($Finding.Method -eq 'secedit') {
+
+                # Check if Secedit binary is available, skip test if not
+                If (-Not (Test-Path $BinarySecedit)) {
+                    Write-BinaryError -Binary $BinarySecedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $Area = "";
+
+                Switch ($Finding.Category) {
+                    "Account Policies" { $Area = "SECURITYPOLICY"; Break }
+                    "Security Options" { $Area = "SECURITYPOLICY"; Break }
+                }
+
+                # MethodArgument comes from the finding list and is written into the security
+                # policy that is applied with secedit /configure /overwrite. Reject control
+                # characters (CR/LF) so a finding list entry cannot inject additional INI lines.
+                If ($Finding.MethodArgument -match "[\r\n]") {
+                    $ResultText = "Invalid MethodArgument, contains control characters"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Continue
+                }
+
+                $TempFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+                $TempDbFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+
+                &$BinarySecedit /export /cfg $TempFileName /areas $Area | Out-Null
+
+                $Data = Get-IniContent $TempFileName
+
+                Set-HashtableValueDeep -Table $Data -Path $Finding.MethodArgument -Value $Finding.RecommendedValue
+
+                Out-IniFile -InputObject $Data -FilePath $TempFileName -Encoding Unicode
+
+                &$BinarySecedit /configure /cfg $TempFileName /overwrite /areas $Area /db $TempDbFileName /quiet | Out-Null
+
+                if ($LastExitCode -ne 0) {
+                    $ResultText = "Failed to configure security policy"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Remove-Item $TempFileName
+                    Remove-Item $TempDbFileName
+                    Continue
+                }
+
+                $ResultText = "Configured security policy"
+                $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                $MessageSeverity = "Passed"
+                $TestResult = "Passed"
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+
+                Remove-Item $TempFileName
+                Remove-Item $TempDbFileName
+            }
+
+            #
+            # auditpol
+            # Set an audit policy
+            #
+            If ($Finding.Method -eq 'auditpol') {
+
+                # Check if Auditpol binary is available, skip test if not
+                If (-Not (Test-Path $BinaryAuditpol)) {
+                    Write-BinaryError -Binary $BinaryAuditpol -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $Success = if ($Finding.RecommendedValue -ilike "*success*") { "enable" } else { "disable" }
+                $Failure = if ($Finding.RecommendedValue -ilike "*failure*") { "enable" } else { "disable" }
+
+                $SubCategory = $Finding.MethodArgument
+
+                &$BinaryAuditpol /set /subcategory:"$($SubCategory)" /success:$($Success) /failure:$($Failure) | Out-Null
+
+                if ($LastExitCode -eq 0) {
+                    $ResultText = "Audit policy set"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                } else {
+                    $ResultText = "Failed to set audit policy"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # accountpolicy
+            # Set a user account policy
+            #
+            If ($Finding.Method -eq 'accountpolicy') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if net binary is available, skip test if not
+                If (-Not (Test-Path $BinaryNet)) {
+                    Write-BinaryError -Binary $BinaryNet -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $Sw = "";
+
+                Switch ($Finding.Name) {
+                    "Force user logoff how long after time expires" { $Sw = "/FORCELOGOFF:$($Finding.RecommendedValue)"; Break }
+                    "Minimum password age" { $Sw = "/MINPWAGE:$($Finding.RecommendedValue)"; Break }
+                    "Maximum password age" { $Sw = "/MAXPWAGE:$($Finding.RecommendedValue)"; Break }
+                    "Minimum password length" { $Sw = "/MINPWLEN:$($Finding.RecommendedValue)"; Break }
+                    "Length of password history maintained" { $Sw = "/UNIQUEPW:$($Finding.RecommendedValue)"; Break }
+                    "Account lockout threshold" { $Sw = "/lockoutthreshold:$($Finding.RecommendedValue)"; Break; }
+                    "Account lockout duration" { $Sw = @("/lockoutwindow:$($Finding.RecommendedValue)", "/lockoutduration:$($Finding.RecommendedValue)"); Break }
+                    "Reset account lockout counter" { $Sw = "/lockoutwindow:$($Finding.RecommendedValue)"; Break }
+                }
+
+                &$BinaryNet accounts $Sw | Out-Null
+
+                if ($LastExitCode -eq 0) {
+                    $ResultText = "Account policy set"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                } else {
+                    $ResultText = "Failed to set account policy"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # accesschk
+            # For the audit mode, accesschk is used, but the rights are set with secedit.
+            #
+            If ($Finding.Method -eq 'accesschk') {
+
+                # Check if Secedit binary is available, skip test if not
+                If (-Not (Test-Path $BinarySecedit)) {
+                    Write-BinaryError -Binary $BinarySecedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $Area = "USER_RIGHTS";
+
+                # MethodArgument comes from the finding list and is written into the security
+                # policy that is applied with secedit /configure /overwrite. Reject control
+                # characters (CR/LF) so a finding list entry cannot inject additional INI lines.
+                If ($Finding.MethodArgument -match "[\r\n]") {
+                    $ResultText = "Invalid MethodArgument, contains control characters"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Continue
+                }
+
+                $TempFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+                $TempDbFileName = New-HardeningKittyTempFile -Directory $HardeningKittyTempDir -CreateFile
+
+                &$BinarySecedit /export /cfg $TempFileName /areas $Area | Out-Null
+
+                # MethodArgument is used to locate and rewrite the matching line. Escape it so it is
+                # treated as literal text and cannot inject regular-expression metacharacters. The
+                # replacement text is likewise escaped so a literal "$" is not interpreted as a
+                # regex substitution token ($1, $&, ...).
+                $MethodArgumentPattern = [regex]::Escape($Finding.MethodArgument) + ".*"
+
+                if ($Finding.RecommendedValue -eq "") {
+                    $Replacement = ($Finding.MethodArgument + " = ").Replace('$', '$$')
+                    (Get-Content -Encoding unicode $TempFileName) -replace $MethodArgumentPattern, $Replacement | Out-File $TempFileName
+                } else {
+                    $ListTranslated = @()
+                    $Finding.RecommendedValue -split ';' | Where-Object {
+                        # Get SID to translate the account name
+                        $AccountSid = Translate-SidFromWellkownAccount -AccountName $_
+                        # Get account name from system with SID (local translation)
+                        $AccountName = Get-AccountFromSid -AccountSid $AccountSid
+                        $ListTranslated += $AccountName
+                    }
+
+                    # If User Right Assignment exists, replace values
+                    If ( ((Get-Content -Encoding unicode $TempFileName) | Select-String -SimpleMatch $Finding.MethodArgument).Count -gt 0 ) {
+                        $Replacement = ($Finding.MethodArgument + " = " + ($ListTranslated -join ',')).Replace('$', '$$')
+                        (Get-Content -Encoding unicode $TempFileName) -replace $MethodArgumentPattern, $Replacement | Out-File $TempFileName
+                    }
+                    # If it does not exist, add a new entry into the file at the right position
+                    Else {
+                        $TempFileContent = Get-Content -Encoding unicode $TempFileName
+                        $LineNumber = $TempFileContent.Count
+                        $TempFileContent[$LineNumber - 3] = "$($Finding.MethodArgument) = $($ListTranslated -join ',')"
+                        $TempFileContent[$LineNumber - 2] = "[Version]"
+                        $TempFileContent[$LineNumber - 1] = 'signature="$CHICAGO$"'
+                        $TempFileContent += "Revision=1"
+                        $TempFileContent | Set-Content -Encoding unicode $TempFileName
+                    }
+                }
+
+                &$BinarySecedit /configure /cfg $TempFileName /overwrite /areas $Area /db $TempDbFileName /quiet | Out-Null
+
+                if ($LastExitCode -ne 0) {
+                    $ResultText = "Failed to configure system user right assignment"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                       $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Remove-Item $TempFileName
+                    Remove-Item $TempDbFileName
+                    Continue
+                }
+
+                $ResultText = "Configured system user right assignment"
+                $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $Finding.RecommendedValue + ", " + $ResultText
+                $MessageSeverity = "Passed"
+                $TestResult = "Passed"
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+
+                Remove-Item $TempFileName
+                Remove-Item $TempDbFileName
+            }
+
+            #
+            # WindowsOptionalFeature
+            # Install / Remove a Windows feature
+            #
+            If ($Finding.Method -eq 'WindowsOptionalFeature') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                #
+                # Check if feature is installed and should be removed, or
+                # it is missing and should be installed
+                #
+                try {
+                    $ResultOutput = Get-WindowsOptionalFeature -Online -FeatureName $Finding.MethodArgument
+                    $Result = $ResultOutput.State
+                } catch {
+                    $ResultText = "Could not check status"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                    If ($Report) {
+                        $ReportResult = [ordered] @{
+                            ID = $Finding.ID
+                            Category = $Finding.Category
+                            Name = $Finding.Name
+                            Severity = $MessageSeverity
+                            Result = $ResultText
+                            Recommended = ""
+                            TestResult = $TestResult
+                            SeverityFinding = ""
+                        }
+                        $ReportAllResults += $ReportResult
+                    }
+                    Continue
+                }
+
+                # Feature will be removed, a reboot will be suppressed
+                If ($Result -eq "Enabled" -and $Finding.RecommendedValue -eq "Disabled") {
+
+                    try {
+                        $Result = Disable-WindowsOptionalFeature -NoRestart -Online -FeatureName $Finding.MethodArgument
+                    } catch {
+                        $ResultText = "Could not be removed"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                        Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                        If ($Log) {
+                            Add-MessageToFile -Text $Message -File $LogFile
+                        }
+                        If ($Report) {
+                            $ReportResult = [ordered] @{
+                                ID = $Finding.ID
+                                Category = $Finding.Category
+                                Name = $Finding.Name
+                                Severity = $MessageSeverity
+                                Result = $ResultText
+                                Recommended = ""
+                                TestResult = $TestResult
+                                SeverityFinding = ""
+                            }
+                            $ReportAllResults += $ReportResult
+                        }
+                        Continue
+                    }
+
+                    $ResultText = "Feature removed"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                }
+                # No changes required
+                ElseIf ($Result -eq "Disabled" -and $Finding.RecommendedValue -eq "Disabled") {
+                    $ResultText = "Feature is not installed"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                }
+                # Feature will be installed, a reboot will be suppressed
+                ElseIf ($Result -eq "Disabled" -and $Finding.RecommendedValue -eq "Enabled") {
+
+                    try {
+                        $Result = Enable-WindowsOptionalFeature -NoRestart -Online -FeatureName $Finding.MethodArgument
+                    } catch {
+                        $ResultText = "Could not be installed"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                        Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                        If ($Log) {
+                            Add-MessageToFile -Text $Message -File $LogFile
+                        }
+                        If ($Report) {
+                            $ReportResult = [ordered] @{
+                                ID = $Finding.ID
+                                Category = $Finding.Category
+                                Name = $Finding.Name
+                                Severity = $MessageSeverity
+                                Result = $ResultText
+                                Recommended = ""
+                                TestResult = $TestResult
+                                SeverityFinding = ""
+                            }
+                            $ReportAllResults += $ReportResult
+                        }
+                        Continue
+                    }
+
+                    $ResultText = "Feature installed"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                }
+                # No changes required
+                ElseIf ($Result -eq "Enabled" -and $Finding.RecommendedValue -eq "Enabled") {
+                    $ResultText = "Feature is already installed"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # MpPreference
+            # Set a Windows Defender policy
+            #
+            If ($Finding.Method -eq 'MpPreference') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $ResultMethodArgument = $Finding.MethodArgument
+                $ResultRecommendedValue = $Finding.RecommendedValue
+
+                Switch ($ResultRecommendedValue) {
+                    "True" { $ResultRecommendedValue = 1; Break }
+                    "False" { $ResultRecommendedValue = 0; Break }
+                }
+
+                # Build a hashtable MpPreferenceArgs for splatting arguments to Set-MpPreference. See https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_splatting
+                $MpPreferenceArgs = @{
+                    $ResultMethodArgument = $ResultRecommendedValue
+                }
+
+                Set-MpPreference @MpPreferenceArgs
+
+                if ($?) {
+                    $ResultText = "Method value modified"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                } else {
+                    $ResultText = "Failed to change Method value"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.MethodArgument + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Passed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # Microsoft Defender Preferences - Attack surface reduction rules (ASR rules)
+            # The values are saved from a PowerShell function into an object.
+            # The desired arguments can be accessed directly.
+            #
+            If ($Finding.Method -eq 'MpPreferenceAsr') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $ResultMethodArgument = $Finding.MethodArgument
+                $ResultRecommendedValue = $Finding.RecommendedValue
+
+                Switch ($ResultRecommendedValue) {
+                    "True" { $ResultRecommendedValue = 1; Break }
+                    "False" { $ResultRecommendedValue = 0; Break }
+                }
+
+                # Build a hashtable MpPreferenceArgs for splatting arguments to Set-MpPreference. See https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_splatting
+                $MpPreferenceArgs = @{
+                    AttackSurfaceReductionRules_Ids     = $ResultMethodArgument
+                    AttackSurfaceReductionRules_Actions = $ResultRecommendedValue
+                }
+
+                Add-MpPreference @MpPreferenceArgs
+
+                if ($?) {
+                    $ResultText = "ASR rule added to list"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.MethodArgument + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                } else {
+                    $ResultText = "Failed to add ASR rule"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $Finding.MethodArgument + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # Exploit protection
+            # Set exploit protection values
+            #
+            # I noticed irregularities when the process mitigations were set individually,
+            # in some cases settings that had already been set were then reset. Therefore,
+            # the settings are collected in an array and finally set at the end of the processing.
+            #
+            If ($Finding.Method -eq 'Processmitigation') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $SettingArgumentArray = $Finding.MethodArgument.Split(".")
+
+                If ( $Finding.RecommendedValue -eq "ON") {
+
+                    If ( $SettingArgumentArray[1] -eq "Enable" ) {
+                        $ProcessmitigationEnableArray += $SettingArgumentArray[0]
+                    } Else {
+                        $ProcessmitigationEnableArray += $SettingArgumentArray[1]
+                    }
+                } ElseIf ( $Finding.RecommendedValue -eq "OFF") {
+
+                    If ($SettingArgumentArray[1] -eq "TelemetryOnly") {
+                        $ProcessmitigationDisableArray += "SEHOPTelemetry"
+                    } ElseIf ( $SettingArgumentArray[1] -eq "Enable" ) {
+                        $ProcessmitigationDisableArray += $SettingArgumentArray[0]
+                    } Else {
+                        $ProcessmitigationDisableArray += $SettingArgumentArray[1]
+                    }
+                }
+                $ResultText = "setting added to list"
+                $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                $MessageSeverity = "Passed"
+                $TestResult = "Passed"
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # bcdedit
+            # Force use of Data Execution Prevention, if it is not already set
+            #
+            If ($Finding.Method -eq 'bcdedit') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check if Bcdedit binary is available, skip test if not
+                If (-Not (Test-Path $BinaryBcdedit)) {
+                    Write-BinaryError -Binary $BinaryBcdedit -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                try {
+
+                    $ResultOutput = &$BinaryBcdedit
+                    $ResultOutput = $ResultOutput | Where-Object { $_ -like "*" + $Finding.RecommendedValue + "*" }
+
+                    If ($ResultOutput -match ' ([a-z,A-Z]+)') {
+                        $Result = $Matches[1]
+                    } Else {
+                        $Result = $Finding.DefaultValue
+                        $ResultDefaultValue = $true
+                    }
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+
+                If ($Result -ne $Finding.RecommendedValue) {
+
+                    try {
+                        $ResultOutput = &$BinaryBcdedit "/set" $Finding.MethodArgument $Finding.RecommendedValue
+                        $ResultExitCode = $LASTEXITCODE
+                    } catch {
+                        $ResultExitCode = 1
+                    }
+
+                    If ($ResultExitCode -eq 0) {
+                        $ResultText = "Setting enabled. Please restart the system to activate it"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+                    } Else {
+                        $ResultText = "Setting could not be enabled"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                    }
+                } Else {
+                    $ResultText = "Setting is already set correct"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # FirewallRule
+            # Create a firewall rule. First it will be checked if the rule already exists
+            #
+            If ($Finding.Method -eq 'FirewallRule') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                $FwState = $Finding.RecommendedValue
+                If ($FwState -eq 'False') {
+                    # Do not create a firewall rule with state equal to false
+                    Continue
+                }
+
+                $FwRule = $Finding.MethodArgument
+                $FwRuleArray = $FwRule.Split("|")
+
+                $FwDisplayName = $Finding.Name
+                $FwProfile = $FwRuleArray[0]
+                $FwDirection = $FwRuleArray[1]
+                $FwAction = $FwRuleArray[2]
+                $FwProtocol = $FwRuleArray[3]
+                $FwLocalPort = @($FwRuleArray[4]).Split(",")
+                $FwProgram = $FwRuleArray[5]
+
+                # Check if rule already exists
+                try {
+
+                    $ResultOutput = Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $FwDisplayName 2> $null
+                    $Result = $ResultOutput.Enabled
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+
+                # Go on if rule not exists
+                If (-Not $Result) {
+
+                    If ($FwProgram -eq "") {
+                        $ResultRule = New-NetFirewallRule -DisplayName $FwDisplayName -Profile $FwProfile -Direction $FwDirection -Action $FwAction -Protocol $FwProtocol -LocalPort $FwLocalPort
+                    } Else {
+                        $ResultRule = New-NetFirewallRule -DisplayName $FwDisplayName -Profile $FwProfile -Direction $FwDirection -Action $FwAction -Program "$FwProgram"
+                    }
+
+                    If ($ResultRule.PrimaryStatus -eq "OK") {
+
+                        # Excellent
+                        $ResultText = "Rule created"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+                    } Else {
+                        # Bogus
+                        $ResultText = "Rule not created"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "High"
+                        $TestResult = "Failed"
+                    }
+                } Else {
+                    # Excellent
+                    $ResultText = "Rule already exists, setting Recommended Value"
+                    Set-NetFirewallRule -DisplayName $FwDisplayName -Enabled $Finding.RecommendedValue
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+
+            #
+            # Scheduled Task
+            # Edit a scheduled task. First it will be checked if a modification is required
+            #
+            If ($Finding.Method -eq 'ScheduledTask') {
+
+                # Check if the user has admin rights, skip test if not
+                If (-not($IsAdmin)) {
+                    Write-NotAdminError -FindingID $Finding.ID -FindingName $Finding.Name -FindingMethod $Finding.Method
+                    Continue
+                }
+
+                # Check the state of the scheduled task
+                try {
+                    $ResultOutput = Get-ScheduledTask -TaskName $Finding.MethodArgument 2> $null
+                    $Result = $ResultOutput.State
+
+                } catch {
+                    $Result = $Finding.DefaultValue
+                    $ResultDefaultValue = $true
+                }
+
+                # Check if a modification is requried
+                If ($Result -eq $Finding.RecommendedValue) {
+
+                    # Excellent
+                    $ResultText = "Scheduled Task has alredy the recommended state"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+
+                } Else {
+
+                    If ($Finding.RecommendedValue -eq "Disabled") {
+
+                        $Result = Get-ScheduledTask -TaskName $Finding.MethodArgument | Disable-ScheduledTask
+
+                        $ResultText = "Scheduled Task was disabled"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+
+                    } ElseIf ($Finding.RecommendedValue -eq "Ready") {
+
+                        $Result = Get-ScheduledTask -TaskName $Finding.MethodArgument | Enable-ScheduledTask
+
+                        $ResultText = "Scheduled Task was enabled"
+                        $Message = "ID " + $Finding.ID + ", " + $Finding.Name + ", " + $ResultText
+                        $MessageSeverity = "Passed"
+                        $TestResult = "Passed"
+                    }
+                }
+
+                Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+
+                If ($Log) {
+                    Add-MessageToFile -Text $Message -File $LogFile
+                }
+
+                If ($Report) {
+                    $ReportResult = [ordered] @{
+                        ID = $Finding.ID
+                        Category = $Finding.Category
+                        Name = $Finding.Name
+                        Severity = $MessageSeverity
+                        Result = $ResultText
+                        Recommended = ""
+                        TestResult = $TestResult
+                        SeverityFinding = ""
+                    }
+                    $ReportAllResults += $ReportResult
+                }
+            }
+        }
+
+        #
+        # After all items of the checklist have been run through, the process mitigation settings can now be set...
+        #
+        If ( $ProcessmitigationEnableArray.Count -gt 0 -and $ProcessmitigationDisableArray.Count -gt 0) {
+
+            $ResultText = "Process mitigation settings set"
+            $MessageSeverity = "Passed"
+            $TestResult = "Passed"
+
+            try {
+                $Result = Set-ProcessMitigation -System -Enable $ProcessmitigationEnableArray -Disable $ProcessmitigationDisableArray
+            } catch {
+                $ResultText = "Failed to set process mitigation settings"
+                $MessageSeverity = "High"
+                $TestResult = "Failed"
+            }
+
+            $Message = "Starting Category Microsoft Defender Exploit Guard"
+            Write-Output "`n"
+            Write-ProtocolEntry -Text $Message -LogLevel "Info"
+
+            $Message = $ResultText
+            Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+            If ($Log) {
+                Add-MessageToFile -Text $Message -File $LogFile
+            }
+            If ($Report) {
+                $ReportResult = [ordered] @{
+                    ID = $Finding.ID
+                    Category = $Finding.Category
+                    Name = $Finding.Name
+                    Severity = $MessageSeverity
+                    Result = $ResultText
+                    Recommended = ""
+                    TestResult = $TestResult
+                    SeverityFinding = ""
+                }
+                $ReportAllResults += $ReportResult
+            }
+        } ElseIf ($ProcessmitigationEnableArray.Count -gt 0 -and $ProcessmitigationDisableArray.Count -eq 0) {
+            $ResultText = "Process mitigation settings set"
+            $MessageSeverity = "Passed"
+            $TestResult = "Passed"
+
+            try {
+                $Result = Set-ProcessMitigation -System -Enable $ProcessmitigationEnableArray
+            } catch {
+                $ResultText = "Failed to set process mitigation settings"
+                $MessageSeverity = "High"
+                $TestResult = "Failed"
+            }
+
+            $Message = "Starting Category Microsoft Defender Exploit Guard"
+            Write-Output "`n"
+            Write-ProtocolEntry -Text $Message -LogLevel "Info"
+
+            $Message = $ResultText
+            Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+            If ($Log) {
+                Add-MessageToFile -Text $Message -File $LogFile
+            }
+            If ($Report) {
+                $ReportResult = [ordered] @{
+                    ID = $Finding.ID
+                    Category = $Finding.Category
+                    Name = $Finding.Name
+                    Severity = $MessageSeverity
+                    Result = $ResultText
+                    Recommended = ""
+                    TestResult = $TestResult
+                    SeverityFinding = ""
+                }
+                $ReportAllResults += $ReportResult
+            }
+        } ElseIf ($ProcessmitigationEnableArray.Count -eq 0 -and $ProcessmitigationDisableArray.Count -gt 0) {
+            $ResultText = "Process mitigation settings set"
+            $MessageSeverity = "Passed"
+            $TestResult = "Passed"
+
+            try {
+                $Result = Set-ProcessMitigation -System -Disable $ProcessmitigationDisableArray
+            } catch {
+                $ResultText = "Failed to set process mitigation settings"
+                $MessageSeverity = "High"
+                $TestResult = "Failed"
+            }
+
+            $Message = "Starting Category Microsoft Defender Exploit Guard"
+            Write-Output "`n"
+            Write-ProtocolEntry -Text $Message -LogLevel "Info"
+
+            $Message = $ResultText
+            Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+            If ($Log) {
+                Add-MessageToFile -Text $Message -File $LogFile
+            }
+            If ($Report) {
+                $ReportResult = [ordered] @{
+                    ID = $Finding.ID
+                    Category = $Finding.Category
+                    Name = $Finding.Name
+                    Severity = $MessageSeverity
+                    Result = $ResultText
+                    Recommended = ""
+                    TestResult = $TestResult
+                    SeverityFinding = ""
+                }
+                $ReportAllResults += $ReportResult
+            }
+        }
+    }
+
+
+    #
+    # Start GPO mode
+    # HardeningKitty configures all settings in a finding list file.
+    # Even though HardeningKitty works very carefully.
+    # The GPO mode create a GPO containing every registry method remediation.
+    #
+    Elseif ($Mode -eq "GPO") {
+
+        Write-Output "`n"
+        If ($GPOname.Length -eq 0) {
+            # Control if a GPO name is given
+            $Message = "The GPO Name $GPOname was not found."
+            Write-ProtocolEntry -Text $Message -LogLevel "Error"
+            Break
+        }
+        If ($FileFindingList.Length -eq 0) {
+            # Control if a Finding list is given
+            $CurrentLocation = $PSScriptRoot
+            $DefaultList = "$CurrentLocation\lists\finding_list_0x6d69636b_machine.csv"
+
+            If (Test-Path -Path $DefaultList) {
+                $FileFindingList = $DefaultList
+            } Else {
+                $Message = "The finding list $DefaultList was not found."
+                Write-ProtocolEntry -Text $Message -LogLevel "Error"
+                Break
+            }
+        }
+
+        # Check if the user has admin rights, skip test if not
+        If (-not($IsAdmin)) {
+            Write-NotAdminError -FindingID "0" -FindingName "GPO Mode" -FindingMethod "Create a GPO"
+            Continue
+        }
+
+        # Check if the New-GPO cmdlet is available
+        try {
+            $CheckRsatStatus = Get-Command New-GPO -ErrorAction Stop
+        } catch {
+            Write-BinaryError -Binary "Group Policy Management PowerShell Module" -FindingID "0" -FindingName "GPO Mode" -FindingMethod "Create a GPO"
+            Continue
+        }
+
+        # Should check if user is domain admin
+        try {
+            New-GPO -Name $GPOname -ErrorAction Stop | Out-Null
+        }
+        catch [System.ArgumentException] {
+            # Control if the Name of the GPO is ok
+            Write-ProtocolEntry -Text $_.Exception.Message -LogLevel "Error"
+            Break
+        }
+
+        # Iterrate over finding list
+        $FindingList = Import-Csv -Path $FileFindingList -Delimiter ","
+
+        # Verify the finding list against the signed official manifest before creating the GPO.
+        # GPO is a write mode: refuse an unverified (custom / modified) list unless the operator
+        # explicitly accepts the risk with -AllowCustomList. This runs before New-GPO so a refused
+        # run does not leave an empty GPO behind.
+        $ListStatus = Confirm-FindingListIntegrity -ListPath $FileFindingList `
+            -ManifestPath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName") `
+            -SignaturePath (Join-Path -Path $PSScriptRoot -ChildPath "lists\$HardeningKittyListManifestName.p7s") `
+            -PinnedThumbprint $HardeningKittyListSigningThumbprint
+        If ($ListStatus.Verified) {
+            Write-ProtocolEntry -Text "Finding list verified as official (signature valid). SHA-256: $($ListStatus.Hash)" -LogLevel "Success"
+        } ElseIf ($AllowCustomList) {
+            Write-ProtocolEntry -Text "Applying an UNVERIFIED finding list at your own risk ($($ListStatus.Reason)). SHA-256: $($ListStatus.Hash)" -LogLevel "Warning"
+        } Else {
+            Write-ProtocolEntry -Text "Refusing to apply an unverified finding list in $Mode mode ($($ListStatus.Reason)). SHA-256: $($ListStatus.Hash). Re-run with -AllowCustomList to apply it at your own risk." -LogLevel "Error"
+            Break
+        }
+
+        ForEach ($Finding in $FindingList) {
+            #
+            # Only Registry Method Policies
+            #
+            If ($Finding.Method -eq "Registry") {
+                $RegType = "String"
+
+                #
+                # Basically this is true, but there is an exception for the finding "MitigationOptions_FontBocking",
+                # the value "10000000000" is written to the registry as a string...
+                #
+                # ... and more exceptions are added over time:
+                #
+                # MitigationOptions_FontBocking => Mitigation Options: Untrusted Font Blocking
+                # Machine => Network access: Remotely accessible registry paths
+                # Retention => Event Log Service: *: Control Event Log behavior when the log file reaches its maximum size
+                # AllocateDASD => Devices: Allowed to format and eject removable media
+                # ScRemoveOption => Interactive logon: Smart card removal behavior
+                # AutoAdminLogon => MSS: (AutoAdminLogon) Enable Automatic Logon (not recommended)
+                #
+                If ($Finding.RegistryItem -eq "MitigationOptions_FontBocking" -Or $Finding.RegistryItem -eq "Retention" -Or $Finding.RegistryItem -eq "AllocateDASD" -Or $Finding.RegistryItem -eq "ScRemoveOption" -Or $Finding.RegistryItem -eq "AutoAdminLogon") {
+                    $RegType = "String"
+                } ElseIf ($Finding.RegistryItem -eq "Machine") {
+                    $RegType = "MultiString"
+                    $Finding.RecommendedValue = $Finding.RecommendedValue -split ";"
+                } ElseIf ($Finding.RecommendedValue -match "^\d+$") {
+                    $RegType = "DWord"
+                    $Finding.RecommendedValue = ConvertToInt -string $Finding.RecommendedValue
+                }
+                $RegPath = $Finding.RegistryPath.Replace(":","")
+                $RegItem = $Finding.RegistryItem
+
+                try {
+                    Set-GPRegistryValue -Name $GPOname -Key $RegPath -ValueName $RegItem -Type $RegType -Value $Finding.RecommendedValue | Out-Null
+                    $ResultText = "Registry value added successfully"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $Finding.RegistryItem + ", " + $ResultText
+                    $MessageSeverity = "Passed"
+                    $TestResult = "Passed"
+                } catch {
+                    $ResultText = "Failed to add registry key"
+                    $Message = "ID " + $Finding.ID + ", " + $Finding.RegistryPath + ", " + $ResultText
+                    $MessageSeverity = "High"
+                    $TestResult = "Failed"
+
+                } finally {
+                    Write-ResultEntry -Text $Message -SeverityLevel $MessageSeverity
+                    If ($Log) {
+                        Add-MessageToFile -Text $Message -File $LogFile
+                    }
+                }
+            }
+        }
+    }
+
+    # Write report file
+    If ($Report) {
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "HardeningKitty prepares the report" -LogLevel "Info"
+        ForEach ($ReportResult in $ReportAllResults) {
+            $ResultObject = [pscustomobject] $ReportResult
+            $ResultObject | Export-Csv -Path $ReportFile -Delimiter "," -NoTypeInformation -Append
+        }
+        Write-ProtocolEntry -Text "Report done" -LogLevel "Info"
+    }
+
+    # Write backup file
+    If ($Backup) {
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "HardeningKitty prepares the backup file" -LogLevel "Info"
+        ForEach ($BackupResult in $BackupAllResults) {
+            $BackupObject = [pscustomobject] $BackupResult
+            $BackupObject | Export-Csv -Path $BackupFile -Delimiter "," -NoTypeInformation -Append
+        }
+        Write-ProtocolEntry -Text "Backup file done" -LogLevel "Info"
+    }
+
+    If ($Mode -eq "Audit") {
+
+        # HardeningKitty Score
+        $StatsTotal = $StatsPassed + $StatsLow + $StatsMedium + $StatsHigh
+        $ScoreTotal = $StatsTotal * 4
+        $ScoreAchived = $StatsPassed * 4 + $StatsLow * 2 + $StatsMedium
+        If ($ScoreTotal -ne 0 ) {
+            $HardeningKittyScore = ([int] $ScoreAchived / [int] $ScoreTotal) * 5 + 1
+        }
+        $HardeningKittyScoreRounded = [math]::round($HardeningKittyScore, 2)
+
+        # Overwrite HardeningKitty Score if no finding is passed
+        If ($StatsPassed -eq 0 ) {
+            $HardeningKittyScoreRounded = 1.00
+        }
+        If ($Script:StatsError -gt 0) {
+            Write-ProtocolEntry -Text "During the execution of HardeningKitty errors occurred due to missing admin rights or tools. For a complete result, these errors should be resolved. Total errors: $Script:StatsError" -LogLevel "Error"
+        }
+        Write-Output "`n"
+        Write-ProtocolEntry -Text "Your HardeningKitty score is: $HardeningKittyScoreRounded. HardeningKitty Statistics: Total checks: $StatsTotal - Passed: $StatsPassed, Low: $StatsLow, Medium: $StatsMedium, High: $StatsHigh." -LogLevel "Info"
+    }
+
+    # Remove the private working directory and any remaining temporary files
+    If ($HardeningKittyTempDir -and (Test-Path -LiteralPath $HardeningKittyTempDir)) {
+        Remove-Item -LiteralPath $HardeningKittyTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-ProtocolEntry -Text "HardeningKitty is done" -LogLevel "Info"
+}
+
+Export-ModuleMember -Function Invoke-HardeningKitty
+
+# SIG # Begin signature block
+# MIItNQYJKoZIhvcNAQcCoIItJjCCLSICAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUiU6k/Q48TgQSc9iBr56w/XI7
+# DhqggiZsMIIFbzCCBFegAwIBAgIQSPyTtGBVlI02p8mKidaUFjANBgkqhkiG9w0B
+# AQwFADB7MQswCQYDVQQGEwJHQjEbMBkGA1UECAwSR3JlYXRlciBNYW5jaGVzdGVy
+# MRAwDgYDVQQHDAdTYWxmb3JkMRowGAYDVQQKDBFDb21vZG8gQ0EgTGltaXRlZDEh
+# MB8GA1UEAwwYQUFBIENlcnRpZmljYXRlIFNlcnZpY2VzMB4XDTIxMDUyNTAwMDAw
+# MFoXDTI4MTIzMTIzNTk1OVowVjELMAkGA1UEBhMCR0IxGDAWBgNVBAoTD1NlY3Rp
+# Z28gTGltaXRlZDEtMCsGA1UEAxMkU2VjdGlnbyBQdWJsaWMgQ29kZSBTaWduaW5n
+# IFJvb3QgUjQ2MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAjeeUEiIE
+# JHQu/xYjApKKtq42haxH1CORKz7cfeIxoFFvrISR41KKteKW3tCHYySJiv/vEpM7
+# fbu2ir29BX8nm2tl06UMabG8STma8W1uquSggyfamg0rUOlLW7O4ZDakfko9qXGr
+# YbNzszwLDO/bM1flvjQ345cbXf0fEj2CA3bm+z9m0pQxafptszSswXp43JJQ8mTH
+# qi0Eq8Nq6uAvp6fcbtfo/9ohq0C/ue4NnsbZnpnvxt4fqQx2sycgoda6/YDnAdLv
+# 64IplXCN/7sVz/7RDzaiLk8ykHRGa0c1E3cFM09jLrgt4b9lpwRrGNhx+swI8m2J
+# mRCxrds+LOSqGLDGBwF1Z95t6WNjHjZ/aYm+qkU+blpfj6Fby50whjDoA7NAxg0P
+# OM1nqFOI+rgwZfpvx+cdsYN0aT6sxGg7seZnM5q2COCABUhA7vaCZEao9XOwBpXy
+# bGWfv1VbHJxXGsd4RnxwqpQbghesh+m2yQ6BHEDWFhcp/FycGCvqRfXvvdVnTyhe
+# Be6QTHrnxvTQ/PrNPjJGEyA2igTqt6oHRpwNkzoJZplYXCmjuQymMDg80EY2NXyc
+# uu7D1fkKdvp+BRtAypI16dV60bV/AK6pkKrFfwGcELEW/MxuGNxvYv6mUKe4e7id
+# FT/+IAx1yCJaE5UZkADpGtXChvHjjuxf9OUCAwEAAaOCARIwggEOMB8GA1UdIwQY
+# MBaAFKARCiM+lvEH7OKvKe+CpX/QMKS0MB0GA1UdDgQWBBQy65Ka/zWWSC8oQEJw
+# IDaRXBeF5jAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zATBgNVHSUE
+# DDAKBggrBgEFBQcDAzAbBgNVHSAEFDASMAYGBFUdIAAwCAYGZ4EMAQQBMEMGA1Ud
+# HwQ8MDowOKA2oDSGMmh0dHA6Ly9jcmwuY29tb2RvY2EuY29tL0FBQUNlcnRpZmlj
+# YXRlU2VydmljZXMuY3JsMDQGCCsGAQUFBwEBBCgwJjAkBggrBgEFBQcwAYYYaHR0
+# cDovL29jc3AuY29tb2RvY2EuY29tMA0GCSqGSIb3DQEBDAUAA4IBAQASv6Hvi3Sa
+# mES4aUa1qyQKDKSKZ7g6gb9Fin1SB6iNH04hhTmja14tIIa/ELiueTtTzbT72ES+
+# BtlcY2fUQBaHRIZyKtYyFfUSg8L54V0RQGf2QidyxSPiAjgaTCDi2wH3zUZPJqJ8
+# ZsBRNraJAlTH/Fj7bADu/pimLpWhDFMpH2/YGaZPnvesCepdgsaLr4CnvYFIUoQx
+# 2jLsFeSmTD1sOXPUC4U5IOCFGmjhp0g4qdE2JXfBjRkWxYhMZn0vY86Y6GnfrDyo
+# XZ3JHFuu2PMvdM+4fvbXg50RlmKarkUT2n/cR/vfw1Kf5gZV6Z2M8jpiUbzsJA8p
+# 1FiAhORFe1rYMIIGHDCCBASgAwIBAgIQM9cIqJFAUxnipbvTObmtbjANBgkqhkiG
+# 9w0BAQwFADBWMQswCQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVk
+# MS0wKwYDVQQDEyRTZWN0aWdvIFB1YmxpYyBDb2RlIFNpZ25pbmcgUm9vdCBSNDYw
+# HhcNMjEwMzIyMDAwMDAwWhcNMzYwMzIxMjM1OTU5WjBXMQswCQYDVQQGEwJHQjEY
+# MBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMS4wLAYDVQQDEyVTZWN0aWdvIFB1Ymxp
+# YyBDb2RlIFNpZ25pbmcgQ0EgRVYgUjM2MIIBojANBgkqhkiG9w0BAQEFAAOCAY8A
+# MIIBigKCAYEAu9H+HrdCW3j1kKeuLIPxjSHTMIaFe9/TzdkWS6yFxbsBz+KMKBFy
+# BHYsgcWrEnpASsUQ6IEUORtfTwf2MDAwfzUl5cBzPUAJlOio+Os5C1XVtgyLHif4
+# 3j4iwb/vZe5z7mXdKN27H32bMn+3mVUXqrJJqDwQajrDIbKZqEPXO4KoGWG1Pmpa
+# Xbi8nhPQCp71W49pOGjqpR9byiPuC+280B5DQ26wU4zCcypEMW6+j7jGAva7ggQV
+# eQxSIOiYJ3Fh7y/k+AL7M1m19MNV59/2CCKuttEJWewBn3OJt0NP1fLZvVZZCd23
+# F/bEdIC6h0asBtvbBA3VTrrujAk0GZUb5nATBCXfj7jXhDOMbKYM62i6lU98ROjU
+# aY0lecMh8TV3+E+2ElWV0FboGALV7nnIhqFp8RtOlBNqB2Lw0GuZpZdQnhwzoR7u
+# YYsFaByO9e4mkIPW/nGFp5ryDRQ+NrUSrXd1esznRjZqkFPLxpRx3gc6IfnWMmfg
+# nG5UhqBkoIPLAgMBAAGjggFjMIIBXzAfBgNVHSMEGDAWgBQy65Ka/zWWSC8oQEJw
+# IDaRXBeF5jAdBgNVHQ4EFgQUgTKSQSsozUbIxKLGKjkS7EipPxQwDgYDVR0PAQH/
+# BAQDAgGGMBIGA1UdEwEB/wQIMAYBAf8CAQAwEwYDVR0lBAwwCgYIKwYBBQUHAwMw
+# GgYDVR0gBBMwETAGBgRVHSAAMAcGBWeBDAEDMEsGA1UdHwREMEIwQKA+oDyGOmh0
+# dHA6Ly9jcmwuc2VjdGlnby5jb20vU2VjdGlnb1B1YmxpY0NvZGVTaWduaW5nUm9v
+# dFI0Ni5jcmwwewYIKwYBBQUHAQEEbzBtMEYGCCsGAQUFBzAChjpodHRwOi8vY3J0
+# LnNlY3RpZ28uY29tL1NlY3RpZ29QdWJsaWNDb2RlU2lnbmluZ1Jvb3RSNDYucDdj
+# MCMGCCsGAQUFBzABhhdodHRwOi8vb2NzcC5zZWN0aWdvLmNvbTANBgkqhkiG9w0B
+# AQwFAAOCAgEAXzas+/n2cloUt/ALHd7Y/ZcB0v0B7pkthuj2t/A5/9aBSlqnQkoK
+# LRWd5pT9xWlKstdL8RYSTPa+kGZliy101KsI92oRAwh3fL5p4bDbnySJA9beXKTg
+# sta0z+M41bltzCfWzmQR6BBydtP54OksielJ07OXlgYK4fYKyEGakV2B2DZ3mMqA
+# QZeo+JE/Y5+qzVRUS4Dq9Rdm05Rx/Z79RzHj6RqGHdO+INI/sVJfspO9jJUJmHKP
+# lQH0mEOlSvsUJqqdNr9ysPzcvYQN7O00qF6VKzgWYwV12fYxLhVr4pSyKtJ0NbWY
+# mqP++CsvthdLJ2xa5rl2XtqG3atk1mrqgxiIGzGC9YizlCXAIS8IaQLjTLtMKhEw
+# 64F5BuFBlSrUIPYLk+R8dgydHSZrX4QB9iqZza/ex/DkGKJOmy8qDGamknUmvtlA
+# NRNvrqY3GnrorRxRYwcqVgZs7X4Y9uPsZHOmbQg2i68Pma51axcrwk1qw1FGQVbp
+# j8KN/xNxm9rtntOfq+VFphLFFFpSQZejBgAIxeYc6ieCPDvb5kbE7y0ANRPNNn2d
+# 5aonCAXMzsA2DksZT9Bjmm2/xSlTMSLbdVB3htDy+GruawYbPoUjK5fIfnqZQQzd
+# WH8OqMMSPTo1m+CdLIwXgVREqHodmJ2Wf1lYplRl/1FCC/hH68/45b8wggaCMIIE
+# aqADAgECAhA2wrC9fBs656Oz3TbLyXVoMA0GCSqGSIb3DQEBDAUAMIGIMQswCQYD
+# VQQGEwJVUzETMBEGA1UECBMKTmV3IEplcnNleTEUMBIGA1UEBxMLSmVyc2V5IENp
+# dHkxHjAcBgNVBAoTFVRoZSBVU0VSVFJVU1QgTmV0d29yazEuMCwGA1UEAxMlVVNF
+# UlRydXN0IFJTQSBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTAeFw0yMTAzMjIwMDAw
+# MDBaFw0zODAxMTgyMzU5NTlaMFcxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0
+# aWdvIExpbWl0ZWQxLjAsBgNVBAMTJVNlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBp
+# bmcgUm9vdCBSNDYwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCIndi5
+# RWedHd3ouSaBmlRUwHxJBZvMWhUP2ZQQRLRBQIF3FJmp1OR2LMgIU14g0JIlL6VX
+# WKmdbmKGRDILRxEtZdQnOh2qmcxGzjqemIk8et8sE6J+N+Gl1cnZocew8eCAawKL
+# u4TRrCoqCAT8uRjDeypoGJrruH/drCio28aqIVEn45NZiZQI7YYBex48eL78lQ0B
+# rHeSmqy1uXe9xN04aG0pKG9ki+PC6VEfzutu6Q3IcZZfm00r9YAEp/4aeiLhyaKx
+# LuhKKaAdQjRaf/h6U13jQEV1JnUTCm511n5avv4N+jSVwd+Wb8UMOs4netapq5Q/
+# yGyiQOgjsP/JRUj0MAT9YrcmXcLgsrAimfWY3MzKm1HCxcquinTqbs1Q0d2VMMQy
+# i9cAgMYC9jKc+3mW62/yVl4jnDcw6ULJsBkOkrcPLUwqj7poS0T2+2JMzPP+jZ1h
+# 90/QpZnBkhdtixMiWDVgh60KmLmzXiqJc6lGwqoUqpq/1HVHm+Pc2B6+wCy/GwCc
+# jw5rmzajLbmqGygEgaj/OLoanEWP6Y52Hflef3XLvYnhEY4kSirMQhtberRvaI+5
+# YsD3XVxHGBjlIli5u+NrLedIxsE88WzKXqZjj9Zi5ybJL2WjeXuOTbswB7XjkZbE
+# rg7ebeAQUQiS/uRGZ58NHs57ZPUfECcgJC+v2wIDAQABo4IBFjCCARIwHwYDVR0j
+# BBgwFoAUU3m/WqorSs9UgOHYm8Cd8rIDZsswHQYDVR0OBBYEFPZ3at0//QET/xah
+# bIICL9AKPRQlMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MBMGA1Ud
+# JQQMMAoGCCsGAQUFBwMIMBEGA1UdIAQKMAgwBgYEVR0gADBQBgNVHR8ESTBHMEWg
+# Q6BBhj9odHRwOi8vY3JsLnVzZXJ0cnVzdC5jb20vVVNFUlRydXN0UlNBQ2VydGlm
+# aWNhdGlvbkF1dGhvcml0eS5jcmwwNQYIKwYBBQUHAQEEKTAnMCUGCCsGAQUFBzAB
+# hhlodHRwOi8vb2NzcC51c2VydHJ1c3QuY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAO
+# vmVB7WhEuOWhxdQRh+S3OyWM637ayBeR7djxQ8SihTnLf2sABFoB0DFR6JfWS0sn
+# f6WDG2gtCGflwVvcYXZJJlFfym1Doi+4PfDP8s0cqlDmdfyGOwMtGGzJ4iImyaz3
+# IBae91g50QyrVbrUoT0mUGQHbRcF57olpfHhQEStz5i6hJvVLFV/ueQ21SM99zG4
+# W2tB1ExGL98idX8ChsTwbD/zIExAopoe3l6JrzJtPxj8V9rocAnLP2C8Q5wXVVZc
+# bw4x4ztXLsGzqZIiRh5i111TW7HV1AtsQa6vXy633vCAbAOIaKcLAo/IU7sClyZU
+# k62XD0VUnHD+YvVNvIGezjM6CRpcWed/ODiptK+evDKPU2K6synimYBaNH49v9Ih
+# 24+eYXNtI38byt5kIvh+8aW88WThRpv8lUJKaPn37+YHYafob9Rg7LyTrSYpyZoB
+# mwRWSE4W6iPjB7wJjJpH29308ZkpKKdpkiS9WNsf/eeUtvRrtIEiSJHN899L1P4l
+# 6zKVsdrUu1FX1T/ubSrsxrYJD+3f3aKg6yxdbugot06YwGXXiy5UUGZvOu3lXlxA
+# +fC13dQ5OlL2gIb5lmF6Ii8+CQOYDwXM+yd9dbmocQsHjcRPsccUd5E9FiswEqOR
+# vz8g3s+jR3SFCgXhN4wz7NgAnOgpCdUo4uDyllU9PzCCBqcwggSPoAMCAQICEQCQ
+# rAhyIP3Fp8RrXMcN9z0GMA0GCSqGSIb3DQEBDAUAMFcxCzAJBgNVBAYTAkdCMRgw
+# FgYDVQQKEw9TZWN0aWdvIExpbWl0ZWQxLjAsBgNVBAMTJVNlY3RpZ28gUHVibGlj
+# IFRpbWUgU3RhbXBpbmcgUm9vdCBSNDYwHhcNMjYwMzI1MDAwMDAwWhcNNDEwMzI0
+# MjM1OTU5WjBVMQswCQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVk
+# MSwwKgYDVQQDEyNTZWN0aWdvIFB1YmxpYyBUaW1lIFN0YW1waW5nIENBIFI0MTCC
+# AiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK7kSqIBrYIcYvlmLVuaA8zw
+# 1RfBhkn4G1CoemzjcYtML6yNUvKmwGH7y6/5MuSC1UYP/+9KYDSqvMQt/1hEKHYx
+# MAD9oZpBkoaDQFEKbOJHelsKe+BaO0ZcENTKfePcraVkA7wrGAW2XHA5gQCQv4IK
+# ori/3PNOXxnDMOk8yIMgVrlMeTxqfWJ4XkjT1xc2s9DD7URHWWJOFobTPoWs6mrD
+# FlaY9FlAHDYTfbzvxQHVsvRmn3W+5ZmCwyk02I8KgGPT/UX4sTz41GiR+ppwUjQX
+# a1+2tEHZbsdAKUtH3OPEVtZvlt7atx4h83IdRR8oYi8wjY3OjFKXFecWpQbzzsPx
+# bUKPwMWiTrzwkrFa8dH/1pDKRJt371W62PfqKPayCr/XbnBOlRn8CALSmHnRtGzu
+# AWtTJpcT3BKw6oy8IIL6wSbu938F6ZIbRNIc1dKbIJtr4ULN6R5ZfTdNEhwXctqp
+# 3RHDbg4fuOl6LjNoaFwjud92EEDhzxFJzE1jqN4csceZIwxOT1aqfsfh0uFQE/lg
+# TBuBs3i6/WL2W1OceWLy3XEdXRK1f0EWCuea6dNfX2RRdjUfk5EltFnJkN2+bWhn
+# K14OPRKcyjOv5hKZ0iV4NRNd1+hjtva1rPyzb5Bs7EvFxqEQhgZbOq7qH3nm0rBw
+# A0dxniBOYCFPdu246JCxAgMBAAGjggFuMIIBajAfBgNVHSMEGDAWgBT2d2rdP/0B
+# E/8WoWyCAi/QCj0UJTAdBgNVHQ4EFgQUOnSlDGfGQlDC/bX8x7spNIL0erkwDgYD
+# VR0PAQH/BAQDAgGGMBIGA1UdEwEB/wQIMAYBAf8CAQAwEwYDVR0lBAwwCgYIKwYB
+# BQUHAwgwIwYDVR0gBBwwGjAIBgZngQwBBAIwDgYMKwYBBAGyMQECAQMIMEwGA1Ud
+# HwRFMEMwQaA/oD2GO2h0dHA6Ly9jcmwuc2VjdGlnby5jb20vU2VjdGlnb1B1Ymxp
+# Y1RpbWVTdGFtcGluZ1Jvb3RSNDYuY3JsMHwGCCsGAQUFBwEBBHAwbjBHBggrBgEF
+# BQcwAoY7aHR0cDovL2NydC5zZWN0aWdvLmNvbS9TZWN0aWdvUHVibGljVGltZVN0
+# YW1waW5nUm9vdFI0Ni5wN2MwIwYIKwYBBQUHMAGGF2h0dHA6Ly9vY3NwLnNlY3Rp
+# Z28uY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAy3lJHZvGeA2b43yhzoarvobHVzbfl
+# +RfuPDwej0wCQkYAN6scTt2GwFe22qbOCv/tllqFlLKQZE+E9jVyuPTbyQHwrM7R
+# 0oLapAEDC1+CowsqSRf/ptira5Pfd4PoHICnb9coPQtyZmHSQp5y9IGvqWf1qNfq
+# 7V2fHZ8DvEQrLUzeoGF9BJRYu2OzacW3QQtUum3NOVf0gPRwv6I4991uhncJ6VP4
+# lcpUpHZKB7R3hiIUC09mR9KjzPVnXHvL9n2bAwiUECfK5Zezhiw27F2tgi39DETf
+# U8M4n0N6xLgFzsf05M5GURX8C9+IX9V6kpmmKtrUzMti4LD66gtmf+mSm934K81N
+# L6YQeMEk1rpYrWPypcW76Mir6wb1AgseLIHqn/GkeuQm7zOTDf3f5WoX14qVNjZW
+# NHF3JxkutV6ZnhinfCLfdv5bnwKWUfceqOajCVntI6uCbHxjBg6SCsexc5AfIGno
+# 7gVFvwifT4XONPsSUaJ71XsJ+EvciVUVnjOO4qxm0fWJTd8a7jP8mc4ZPqwJvQFt
+# Op7+6G+kUJAF0fnE8YgD8uttBReNTa1YmAeFMiqc38e8fI4eLm0zjM/eeGCHasno
+# qqrbGwcF41iz9HXzFDwN4iD5z3QShp6HRiU3UpTwDJiiXcr0z6pjl7PyzJ3/tmWt
+# GehV7CAfc/WlyzCCBr4wggUmoAMCAQICEFjX+P4AIZWTs1+TYQBns3swDQYJKoZI
+# hvcNAQELBQAwVzELMAkGA1UEBhMCR0IxGDAWBgNVBAoTD1NlY3RpZ28gTGltaXRl
+# ZDEuMCwGA1UEAxMlU2VjdGlnbyBQdWJsaWMgQ29kZSBTaWduaW5nIENBIEVWIFIz
+# NjAeFw0yMzA4MjEwMDAwMDBaFw0yNjA4MjAyMzU5NTlaMIGRMRgwFgYDVQQFEw9D
+# SEUtMTA5LjgwNC4zODIxEzARBgsrBgEEAYI3PAIBAxMCQ0gxHTAbBgNVBA8TFFBy
+# aXZhdGUgT3JnYW5pemF0aW9uMQswCQYDVQQGEwJDSDEQMA4GA1UECAwHWsO8cmlj
+# aDEQMA4GA1UECgwHc2NpcCBhZzEQMA4GA1UEAwwHc2NpcCBhZzCCAiIwDQYJKoZI
+# hvcNAQEBBQADggIPADCCAgoCggIBALNDqgJV5RRiMAJ5e8iGcC8Q2ENMyhFDeXm4
+# KGGe3vqZVynLeacyvB7Gqosn3G+hfHg33kFeKWgFulrw4Zz9zU7ilqxUU/npeKp/
+# QhppTAeppNagzYt2kRSjdaNQsZw3HFGhALdSLhRO0c5WWLEdTm4+jFWnkRoxveJb
+# zJsUaNyhhF3VO+h762XjzXwqcBaueqfKgVVzk/Wh+H3efxkhv2Qvv1za7P3g+Jgx
+# UJm8ZCLq9VPK1lIsi1inGw/jUHyrapf1pyZUqEHhVPB4/on8bZjwEbwNsska40S4
+# JMpEuPijuEMSlgjs0qy0nJh/cAgBBP3MHgE0uWPfurpipf3+5nh1h3J0EmXeGLHm
+# 7cjuEJusTcVtmR+Lm3wFgre//X5a30Lr66ihSZwtF2izyZhIHgi6wpEjiee6kJgL
+# /ZuUBQJBLKnmMuw4l7F2BqVV0p7sCPyZ3raUFEZxrZqMILMYSmTmIAx+rjcScpxq
+# iJjhqOxGeIN8oNGCQnUlRZUKILCIj9RO4tq/aKVCRzcHM+u/ctdBAzrx0B5HoSvQ
+# /PjqJIn9veyAhtCie988KLfGtK9rF9W547whmBn6hjkzh9gTel5gjVQUNK6+OGak
+# WWf86VWrpKBop7bCKA66e59Hd4M674u2rwe3pfhG/ktKtT8GMQ1GE+ynbt/JYAOI
+# mlnuu7cBAgMBAAGjggHJMIIBxTAfBgNVHSMEGDAWgBSBMpJBKyjNRsjEosYqORLs
+# SKk/FDAdBgNVHQ4EFgQU+U/LlyHiKHvC6PbxZXmvqntTohMwDgYDVR0PAQH/BAQD
+# AgeAMAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwSQYDVR0gBEIw
+# QDA1BgwrBgEEAbIxAQIBBgEwJTAjBggrBgEFBQcCARYXaHR0cHM6Ly9zZWN0aWdv
+# LmNvbS9DUFMwBwYFZ4EMAQMwSwYDVR0fBEQwQjBAoD6gPIY6aHR0cDovL2NybC5z
+# ZWN0aWdvLmNvbS9TZWN0aWdvUHVibGljQ29kZVNpZ25pbmdDQUVWUjM2LmNybDB7
+# BggrBgEFBQcBAQRvMG0wRgYIKwYBBQUHMAKGOmh0dHA6Ly9jcnQuc2VjdGlnby5j
+# b20vU2VjdGlnb1B1YmxpY0NvZGVTaWduaW5nQ0FFVlIzNi5jcnQwIwYIKwYBBQUH
+# MAGGF2h0dHA6Ly9vY3NwLnNlY3RpZ28uY29tMDsGA1UdEQQ0MDKgIgYIKwYBBQUH
+# CAOgFjAUDBJDSC1DSEUtMTA5LjgwNC4zODKBDG1pc2NAc2NpcC5jaDANBgkqhkiG
+# 9w0BAQsFAAOCAYEAg/MzS935kdWYiX5Wx4LUNVSSS6RwRbtQb5uik5pPD+eqvp0z
+# OqCWkIxOcO5grfNKXem1OVYKeiTUQaMU2yw9+vy6gWyCihuU5mkSCiVtzjmk29PQ
+# RFI//zkw69MmpUfWR8mFYMAob0HEmSGSGVz1sT3wyC+uUQn+r/DH6Vcfvf1l56vC
+# +zZj8wxR5Kpk+ZO5zZiSGItOmakhP0pdy+NhoVAHaYodF6tBOmYsaC7a3OjvKgkm
+# sFwana2tAf7rx1ZOLLCwwTuCWutIqQlMH7ztSaJJN0RPHYfakY6Hrkd7f81B7/69
+# wjZIEHQJdK3DYCGFF56aP/Dog2LYViSE7VJqD2KcX/UrrbD/+BmxJH9gHx2UbT4w
+# Cw1o8loJedyI8/l8bZchmxBxop3x1P1j7C0ESKCg1fQmzQ2YxbC/KAvfekbCPMhz
+# 213eTsqQ7eAl471UjmiqntE8gB7DQdMHk/JZLULQFc1Uwug412KekEZNenQ/wMfZ
+# hiwcFCo+CYiBR5U3MIIG4jCCBMqgAwIBAgIRAOdO8lWwUE/626bf9/yLoxUwDQYJ
+# KoZIhvcNAQEMBQAwVTELMAkGA1UEBhMCR0IxGDAWBgNVBAoTD1NlY3RpZ28gTGlt
+# aXRlZDEsMCoGA1UEAxMjU2VjdGlnbyBQdWJsaWMgVGltZSBTdGFtcGluZyBDQSBS
+# NDEwHhcNMjYwMzI1MDAwMDAwWhcNMzcwNjI0MjM1OTU5WjByMQswCQYDVQQGEwJH
+# QjEXMBUGA1UECBMOR3JlYXRlciBMb25kb24xGDAWBgNVBAoTD1NlY3RpZ28gTGlt
+# aXRlZDEwMC4GA1UEAxMnU2VjdGlnbyBQdWJsaWMgVGltZSBTdGFtcGluZyBTaWdu
+# ZXIgUjM3MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsv/DbUvcUNlF
+# LQURd9m4+1St5+JudFKo5P803Iks4mFeNB9SymodP6BJJWBuNhOFQj9w77AVAeg5
+# qQpA2dIwp2QTyBHr2h9eWSTkMBVj9mV6+WI5SaW+vDZW7PhJTbysd9v9WB3Xt6ql
+# Ei8m47pcTy8+k/OfhziKiuzNQXqfC7KcoRD/6up8OZBsU0qxr7n5nh/iRfAp1QXF
+# TBQONBZSGIdHAyVRYYX033VoC8v71rizEKCpH97Pxbwcn9eq9K7W8h5v4npsMUoq
+# CS/c8mQwylDQGx15dHYV6NlcVFdjXD11l7qCrIy/unH5OlZtgx58QJRXRbGgQyBd
+# STpEpwuj3i5Qc52Z9m7hd7yCGCXKujf83hUQpOPx1w8+84EbEUTHVAfq4cpORaGW
+# gY8NJy6txmd3wpS1MeXrOaVAMczTgzAZ+yZBWIqdgQBgTxEeXldEToZOrRkxvn1I
+# jIlfr4I4NWJz+Rb52FshLVnkA/wdoad789Eb7XZDNKd4oMmnc636TgauaaVZP2LL
+# oU0JD/fYr53hwBn4uXu5ZsSfpnqAT60S7szJm/Na882xEoyRzLJ+UVbXOlHLO63D
+# KkAtdz1CDuwWxgRE1drnwplepT06dz+1yTr5p1AkUz21bzE6cT/8/kjh4OPzggYY
+# qrOBQPfuKEL5ZJPcN9jRgEpYvRlq5ucCAwEAAaOCAY4wggGKMB8GA1UdIwQYMBaA
+# FDp0pQxnxkJQwv21/Me7KTSC9Hq5MB0GA1UdDgQWBBRhEOl6Eq9RxIXU8s+kdA9Q
+# zSCv+DAOBgNVHQ8BAf8EBAMCBsAwDAYDVR0TAQH/BAIwADAWBgNVHSUBAf8EDDAK
+# BggrBgEFBQcDCDBKBgNVHSAEQzBBMAgGBmeBDAEEAjA1BgwrBgEEAbIxAQIBAwgw
+# JTAjBggrBgEFBQcCARYXaHR0cHM6Ly9zZWN0aWdvLmNvbS9DUFMwSgYDVR0fBEMw
+# QTA/oD2gO4Y5aHR0cDovL2NybC5zZWN0aWdvLmNvbS9TZWN0aWdvUHVibGljVGlt
+# ZVN0YW1waW5nQ0FSNDEuY3JsMHoGCCsGAQUFBwEBBG4wbDBFBggrBgEFBQcwAoY5
+# aHR0cDovL2NydC5zZWN0aWdvLmNvbS9TZWN0aWdvUHVibGljVGltZVN0YW1waW5n
+# Q0FSNDEuY3J0MCMGCCsGAQUFBzABhhdodHRwOi8vb2NzcC5zZWN0aWdvLmNvbTAN
+# BgkqhkiG9w0BAQwFAAOCAgEAA+o9jdGszfoZepOmygef1OlbkjrPd2QW9z3M8vVb
+# QSCruPeO2eRsC9GhZ4CMZfhkrixayYD67gQkbyiRCbJu5L/i0NQjlQhBvbWfiEba
+# +KHFKGud5YHRWhDZUtDeMIJGZG0BD7/sftZUo2Ifk+CXi/ZlM50+xK3OkqeXVi5G
+# ubDD/5txmYuqCT3T3LAilmoB+5th9sQxiMhyQuT3R/aYb4vypoZJLYklUzTalXle
+# W1nV9s4UROlE389CHDKAi/fepRSMnV8TghODDQxwzNGrOJZ04k/yhzHHDupfHPU5
+# 1FYJqXIvWq9SAAWdlNV1JGIxhkp/TAtxBwz/Vd/VbgVb2d9/wRFfxFkka39O0+4x
+# aZSl/oEK/1DqjxjJRO2Se9lGlJDScu21Zd23Cys3aYyB8y5H/+DFWtVe8PMKgr+V
+# uIDp0Rk5bneVDAEW0TPAT8Ufwl2F6DJiDg/KZk5NmsYES+CxvF7bnISEnQh0ZrWn
+# AJixquV0mElUx01wA5TuPIgyodxzNq/fC0hen9LBtdnfFfSZ+wt8A1Injsbio+DH
+# Vq1voYiVNpBfO7+nh9NB4AhRXNldPgr3zgjJ+47s0uNYy2iDXAZSlkP3ym/7gy31
+# jlu989SNpRWO14/LUNV2LSuXkRI1iLTPI6ZdXG0DnPPG7UftF0tk5m6BP9eNfr2t
+# j1sxggYzMIIGLwIBATBrMFcxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0aWdv
+# IExpbWl0ZWQxLjAsBgNVBAMTJVNlY3RpZ28gUHVibGljIENvZGUgU2lnbmluZyBD
+# QSBFViBSMzYCEFjX+P4AIZWTs1+TYQBns3swCQYFKw4DAhoFAKB4MBgGCisGAQQB
+# gjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYK
+# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwIwYJKoZIhvcNAQkEMRYEFFbIwGdv
+# Qie3soV4AklafkEc0YTQMA0GCSqGSIb3DQEBAQUABIICAKRxPpWSKHINZAGFqcZY
+# hVxm8aOD8Q4XkeW7HtGpVvULm2m7NDW+3ECb/8OoL7W8GMmguYYwu6YZH93NGghk
+# +nNDosXjaKkvd9GMA/pTZajd5BCoHFyzd/+d6QmxEPpeEPcFZHIVx/xil/UfC16L
+# rVnTGbnTpwMZZLdS8N6RuMccrx6xWO9Rl4Z3WvdzNUwsYCQOWdXI89wpSd9p4ky5
+# 1ZQzBjvBffye/QPnV9v33CujUTCcMuukF+DbysWKQTXJneRYj5HdHLux1yTy3v/8
+# oclfh5WqNSSxYepxAKkPFJg0SQCmyPMuTGZ5IQSXLyV5fZXRhsHbM6ndSKHLiX+K
+# rA/h/DPoRoATZotwMiGQwHZPVYh+9vmsYO1SCI4COrQch78d0U0jUiV/pHw6TsD7
+# 3+ZVTaKfc7UVErNC8Kf5CJ+6J+/3QGSDdnCR9SkCJ9hgCNAL4H3qsjh68KE0wkjF
+# pgW2Mskzz0tcRY+mUEaEHlhAAKqmEvmhhcW0LtEUjyN+1Bl9E9XKvP8AptwfqPOF
+# YaJ13MZaFFwWsolUrQYuOEbC40ppguSwMMMy0hDwJx9aNA7myf+sBn3DCIqdA34a
+# y/AG7OPsoYVqix6QGfqxUqZJUeaedVE+Okt/T9ZANXtUWKYhjAF+mTSNVPeY/KmA
+# 2++8kmjXyuD8hVTMuzPbw6tLoYIDIzCCAx8GCSqGSIb3DQEJBjGCAxAwggMMAgEB
+# MGowVTELMAkGA1UEBhMCR0IxGDAWBgNVBAoTD1NlY3RpZ28gTGltaXRlZDEsMCoG
+# A1UEAxMjU2VjdGlnbyBQdWJsaWMgVGltZSBTdGFtcGluZyBDQSBSNDECEQDnTvJV
+# sFBP+tum3/f8i6MVMA0GCWCGSAFlAwQCAgUAoHkwGAYJKoZIhvcNAQkDMQsGCSqG
+# SIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIxMDUwNDMwWjA/BgkqhkiG9w0B
+# CQQxMgQwwcl6hBFtbOTMof65N0wB0ji0yX7+eURwPbTE4RXI2huIi8TQt7bGqgeM
+# yLw0JI96MA0GCSqGSIb3DQEBAQUABIICACF2jdbkJtF1hQz1B1450/xulOXKvs2p
+# x2zoHKCTwC82G8bsbGWzaK0LBdJTPrqUW4bAWkDEmF9jCFKC2iCHtd3uOxUAy7+d
+# 2CKdtM/02x3RN0+D0RnpRnBmvvG2Hq9xVOpzwRNeUgLmKaRAT3vBSjpPsn5wHQug
+# NCSRkSK62eX2NO2+Gg0NSkSPe5WBjCtuTnwuqetdkWHiunUf9G4yrY/SHASTELqQ
+# 3EIlvo/7pHQ2RLyBSghndJLEWHmpdVnvt+pZr5ZM/DlOk79qa524czQOZ5ApLZwD
+# wDl0sV9qtYrqP/owE0JO7TxCSFhRpU8Dw7xWcbmMroW9ryq5SVdL4BVzWGQ4AhKV
+# hfTYzxO5R4sG9GA+TGxq3kAggKFeCWktSCi0VMpo5S8URFYNPE03t37lM1yTFmWs
+# mc6XpsOJkdFYxhcLijsGK/ez1I+R6mNxvBIhXPPN6vRZF7O6sUIkMljrXbtHanpZ
+# tkcYuph0lCage60OJuVuMeEpI9p8EJ1eflSxor6OA/UK9HlU3nLR10X+dCZCEev2
+# PXoTIj8VvxY1ymKs3QsBtrvD89aj1AR/qxJqUO1fMx+9cqIQZ10VfhK/eBVJJlso
+# WiFTydOAD/OkGyMFJDocLt3itxBaFnTfWKtZd6/p/KbDUk5Zdr9uTu5vkTmaOAUy
+# ZOioeDe/A3D2
+# SIG # End signature block

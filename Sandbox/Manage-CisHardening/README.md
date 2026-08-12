@@ -34,7 +34,7 @@ reviewable.
 |---|---|---|
 | CIS Windows 11 Enterprise Benchmark | Vendor-documented | Authoritative PDF from CIS (cisecurity.org). Requires free account to download. |
 | HardeningKitty module (`HardeningKitty.psm1`) | Community-maintained | scipag/HardeningKitty, MIT license. Widely used; not affiliated with CIS. |
-| Finding list CSV (`finding_list_cis_microsoft_windows_11_enterprise_22h2_machine.csv`) | Community-maintained | A translation of the CIS Win11 v2.x benchmark into HardeningKitty's CSV format. **Not official CIS content.** Lags the current CIS benchmark version. |
+| Finding list CSV (`finding_list_cis_microsoft_windows_11_enterprise_24h2_machine.csv`) | Community-maintained | A translation of the CIS Win11 24H2 benchmark into HardeningKitty's CSV format. **Not official CIS content.** |
 | Pruned finding list (`finding_list_iru_cis_win11_machine.csv`) | Internal / inferred | Our fork of the above with fleet-breaking controls removed or adjusted. Deltas documented in `PRUNING.md`. |
 
 **Customer-facing statement:** Organizations that require certified CIS remediation
@@ -48,8 +48,9 @@ CIS-certified content.
 Manage-CisHardening/
   README.md                                  <- this file
   PRUNING.md                                 <- documented deltas from upstream CSV
-  Audit-CisHardening.ps1                     <- Iru Audit slot script
-  Remediate-CisHardening.ps1                 <- Iru Remediation slot script
+  Manage-CisHardening.ps1                    <- single script, both Iru slots
+                                                (Audit slot: $Mode='Audit',
+                                                 Remediation slot: $Mode='Enforce')
   payload/
     HardeningKitty.psm1                      <- pinned module (see PINNED VERSION)
     HardeningKitty.psd1
@@ -61,10 +62,12 @@ Manage-CisHardening/
 
 | Item | Value |
 |---|---|
-| HardeningKitty release | `<TAG>` (e.g. 0.9.x -- pin to a release tag, never master) |
-| Module SHA256 | `<HASH>` |
-| Finding list base | CIS Microsoft Windows 11 Enterprise 22H2 (machine), HardeningKitty upstream |
-| Finding list SHA256 (pruned) | `<HASH>` |
+| HardeningKitty release | `v.0.9.4` (pinned tag; raw URLs verified byte-identical to tag archive) |
+| Module SHA256 (psm1) | `01EBA5F0F4F11FA21616946BD9EA7ECCD56079ABB9CAFDC7B8E7C60C75F63AEE` |
+| Manifest SHA256 (psd1) | `9789FF549F0E9D4FFF0D1DD31620459B9AF3BB47968D202A83C24B0EA5641BDE` |
+| Finding list base | CIS Microsoft Windows 11 Enterprise 24H2 (machine), HardeningKitty v.0.9.4, 647 controls |
+| Pruned baseline | 450 L1 controls (L2 and BitLocker profiles removed -- see PRUNING.md) |
+| Finding list SHA256 (pruned) | `88FEB973A6DDAE84D0AA5A0AF0B090B3649E446B185CD2D621FEB19240D5C478` |
 
 The staging logic verifies these hashes before importing the module. A hash mismatch
 is treated as a hard failure (exit 2) -- the script will not execute unverified code
@@ -72,7 +75,7 @@ as SYSTEM.
 
 ## Requirements
 
-- Windows 11 (22H2 or later; controls carry forward to newer builds -- see Known Limitations)
+- Windows 11 (build 22000+ enforced by the script; baseline targets 24H2, controls carry forward -- see Known Limitations)
 - Windows PowerShell 5.1 (not PowerShell 7)
 - Execution as SYSTEM via Iru Custom Script Library Item
 - English-language OS (HardeningKitty's secedit/User Rights parsing assumes English strings)
@@ -104,7 +107,7 @@ wrapper handles this with a stage-and-verify pattern:
 An alternative fully self-contained variant (payload base64-embedded in the script,
 ~600 KB) exists for environments where endpoints cannot reach the staging URL.
 
-### Audit slot (`Audit-CisHardening.ps1`)
+### Audit slot (`$Mode = 'Audit'`)
 
 1. Stage/verify payload
 2. `Invoke-HardeningKitty -Mode Audit -FileFindingList <pruned CSV>`
@@ -117,7 +120,7 @@ timing, pending reboots, or values managed by overlapping profiles. Requiring 10
 causes remediation churn without a security benefit. Adjust `$PassRateThreshold` at
 the top of the script if a customer requires a stricter posture.
 
-### Remediation slot (`Remediate-CisHardening.ps1`)
+### Remediation slot (`$Mode = 'Enforce'`)
 
 1. Stage/verify payload
 2. Snapshot current values: `Invoke-HardeningKitty -Mode Config -Backup` (best-effort
@@ -128,6 +131,13 @@ the top of the script if a customer requires a stricter posture.
 Audit re-runs on the next agent check-in and confirms convergence. Some controls only
 take effect after reboot; expect one audit cycle of residual findings on freshly
 remediated devices.
+
+### Discover mode (`$Mode = 'Discover'`)
+
+Read-only dump of the device's current values for every control in the finding list
+(HardeningKitty Config mode), written to `Reports\discover_<timestamp>.csv`. No
+comparison, no changes, always exits 0 on success. Useful for the Ring 1 audit-only
+phase and for capturing before-state evidence per device.
 
 ## Deployment Steps
 
@@ -149,8 +159,11 @@ the reason.
 ### 2. Create the Library Item
 
 - Iru console -> Library -> Custom Script
-- Paste `Audit-CisHardening.ps1` into the **Audit** slot
-- Paste `Remediate-CisHardening.ps1` into the **Remediation** slot
+- Paste `Manage-CisHardening.ps1` into the **Audit** slot with `$Mode = 'Audit'`
+- Paste the identical file into the **Remediation** slot with `$Mode = 'Enforce'`
+  (the mode line is the only difference between the two slots)
+- Populate the pinned URLs and SHA256 hashes in the config block first -- the
+  script fails closed (exit 2) if placeholders remain
 - Execution frequency: daily is sufficient; the audit is read-heavy but not free
   (a full CIS pass takes a few minutes per device)
 
