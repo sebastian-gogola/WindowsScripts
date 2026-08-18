@@ -1,0 +1,596 @@
+<#
+.SYNOPSIS
+    Generates AV/EDR test artifacts in a Defender-excluded path so Iru EDR can be
+    observed detecting them, rather than losing the race to Microsoft Defender.
+
+.DESCRIPTION
+    On Windows, Microsoft Defender owns the filesystem minifilter and gets first
+    look at every write. Unless a third-party AV registers with Windows Security
+    Center (which forces Defender into passive mode), Defender will win every
+    commodity-signature race and Iru EDR will never report the detection.
+
+    This script scopes a narrow Defender exclusion to a single test directory,
+    writes EICAR test artifacts into it, and then reports which artifacts were
+    removed. Because Defender is excluded from that path, any quarantine that
+    occurs there is attributable to Iru EDR.
+
+    EICAR is a 68-byte industry-standard test string with no payload. It is
+    assembled at runtime from fragments so that this script file does not itself
+    match the signature and get quarantined before it can run.
+
+.PARAMETER Mode
+    Audit    - Report whether today's test has run. Exit 1 signals Iru to run
+               the remediation.
+    Enforce  - Set the exclusion, generate artifacts, wait, and report results.
+    Discover - Read-only inventory of the AV stack. Never changes state.
+    Revert   - Remove the exclusion, artifacts, and stored state.
+
+.PARAMETER TestPath
+    Directory that receives the test artifacts and is excluded from Defender.
+
+.PARAMETER SettleSeconds
+    How long to wait after writing artifacts before evaluating what survived.
+
+.PARAMETER SkipExclusion
+    Generate artifacts without touching Defender's exclusion list. Useful for
+    demonstrating that Defender wins when no exclusion is present.
+
+.NOTES
+    Requires Windows PowerShell 5.1 running as SYSTEM or elevated administrator.
+
+    ENCODING: this file is deliberately pure ASCII. Non-ASCII punctuation such as
+    em dashes and curly quotes gets mangled when the agent writes the script to
+    its cache without a BOM, and Windows PowerShell 5.1 treats curly quotes as
+    valid string delimiters, which produces an unterminated-string parser error.
+    Keep any edits ASCII-only.
+
+    LIBRARY ITEM WIRING
+        Audit script:       paste as-is (Mode defaults to Audit)
+        Remediation script: paste as-is, but change the Mode default to 'Enforce'
+
+    Exit codes
+        0 - Compliant / operation succeeded
+        1 - Non-compliant / remediation required
+        2 - Error
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [ValidateSet('Audit', 'Enforce', 'Discover', 'Revert')]
+    [string]$Mode = 'Audit',
+
+    [string]$TestPath = "$env:ProgramData\IruScripts\EdrTest\badfiles",
+
+    [ValidateRange(5, 600)]
+    [int]$SettleSeconds = 45,
+
+    [switch]$SkipExclusion
+)
+
+$ErrorActionPreference = 'Stop'
+
+#region Configuration ---------------------------------------------------------
+
+$Script:ScriptName = 'Manage-EdrTestFiles'
+$Script:LogDir     = "$env:ProgramData\IruScripts\Logs"
+$Script:LogPath    = Join-Path $Script:LogDir "$($Script:ScriptName).log"
+$Script:RegPath    = 'HKLM:\SOFTWARE\IruScripts\EdrTestFiles'
+
+# Adjust if the Iru Windows agent service name differs in your tenant. Used for
+# presence detection only.
+$Script:AgentServicePattern = @('*iru*', '*kandji*')
+
+$Script:ExitCompliant    = 0
+$Script:ExitNonCompliant = 1
+$Script:ExitError        = 2
+
+#endregion
+
+#region Logging ---------------------------------------------------------------
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $line  = "[$stamp] [$Level] $Message"
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:LogDir)) {
+            New-Item -Path $Script:LogDir -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        # Logging must never be the reason the script fails.
+    }
+
+    switch ($Level) {
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        default { Write-Host $line }
+    }
+}
+
+#endregion
+
+#region State -----------------------------------------------------------------
+
+function Get-State {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:RegPath)) { return $null }
+        $item = Get-ItemProperty -LiteralPath $Script:RegPath -Name $Name -ErrorAction Stop
+        return $item.$Name
+    }
+    catch {
+        return $null
+    }
+}
+
+function Set-State {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if (-not (Test-Path -LiteralPath $Script:RegPath)) {
+        New-Item -Path $Script:RegPath -Force | Out-Null
+    }
+
+    New-ItemProperty -LiteralPath $Script:RegPath -Name $Name -Value $Value -PropertyType String -Force | Out-Null
+}
+
+function Remove-State {
+    try {
+        if (Test-Path -LiteralPath $Script:RegPath) {
+            Remove-Item -LiteralPath $Script:RegPath -Recurse -Force
+            Write-Log "Removed state key $($Script:RegPath)"
+        }
+    }
+    catch {
+        Write-Log "Could not remove state key: $($_.Exception.Message)" -Level WARN
+    }
+}
+
+#endregion
+
+#region AV stack inspection ---------------------------------------------------
+
+function Get-RegisteredAvProduct {
+    # Products registered with Windows Security Center. If a third-party AV
+    # appears here, Defender should have dropped to passive mode on its own.
+    try {
+        $products = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName 'AntiVirusProduct' -ErrorAction Stop
+        return @($products | Select-Object displayName, productState, pathToSignedProductExe)
+    }
+    catch {
+        Write-Log "Could not query Security Center: $($_.Exception.Message)" -Level WARN
+        return @()
+    }
+}
+
+function Get-DefenderStatus {
+    $present         = $false
+    $realTimeEnabled = $null
+    $runningMode     = 'Unknown'
+    $tamperProtected = $null
+
+    try {
+        $status  = Get-MpComputerStatus -ErrorAction Stop
+        $present = $true
+
+        $props = $status.PSObject.Properties.Name
+
+        if ($props -contains 'RealTimeProtectionEnabled') {
+            $realTimeEnabled = $status.RealTimeProtectionEnabled
+        }
+
+        # AMRunningMode and IsTamperProtected are absent on older builds.
+        if ($props -contains 'AMRunningMode') {
+            $runningMode = $status.AMRunningMode
+        }
+        if ($props -contains 'IsTamperProtected') {
+            $tamperProtected = $status.IsTamperProtected
+        }
+    }
+    catch {
+        Write-Log "Defender cmdlets unavailable: $($_.Exception.Message)" -Level WARN
+    }
+
+    return [PSCustomObject]@{
+        Present         = $present
+        RealTimeEnabled = $realTimeEnabled
+        RunningMode     = $runningMode
+        TamperProtected = $tamperProtected
+    }
+}
+
+function Test-ExclusionPresent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $current = (Get-MpPreference -ErrorAction Stop).ExclusionPath
+        if (-not $current) { return $false }
+
+        foreach ($entry in $current) {
+            if ($entry -eq $Path) { return $true }
+        }
+        return $false
+    }
+    catch {
+        Write-Log "Could not read Defender exclusions: $($_.Exception.Message)" -Level WARN
+        return $false
+    }
+}
+
+function Add-TestExclusion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (Test-ExclusionPresent -Path $Path) {
+        Write-Log "Defender exclusion already present for $Path"
+        return $true
+    }
+
+    try {
+        Add-MpPreference -ExclusionPath $Path -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Add-MpPreference failed: $($_.Exception.Message)" -Level ERROR
+        return $false
+    }
+
+    # Tamper Protection can reject the change without raising an error, so the
+    # write is verified rather than assumed.
+    Start-Sleep -Seconds 2
+
+    if (Test-ExclusionPresent -Path $Path) {
+        Write-Log "Added Defender exclusion for $Path"
+        Set-State -Name 'ExclusionAdded' -Value '1'
+        return $true
+    }
+
+    Write-Log 'Exclusion did not persist. Tamper Protection is likely enabled. Set the exclusion via policy instead.' -Level ERROR
+    return $false
+}
+
+function Remove-TestExclusion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-ExclusionPresent -Path $Path)) { return }
+
+    try {
+        Remove-MpPreference -ExclusionPath $Path -ErrorAction Stop
+        Write-Log "Removed Defender exclusion for $Path"
+    }
+    catch {
+        Write-Log "Could not remove exclusion: $($_.Exception.Message)" -Level WARN
+    }
+}
+
+function Get-RecentDefenderDetection {
+    param(
+        [int]$MinutesBack = 10
+    )
+
+    try {
+        $since = (Get-Date).AddMinutes(-$MinutesBack)
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-Windows Defender/Operational'
+            Id        = 1116, 1117
+            StartTime = $since
+        } -ErrorAction Stop
+
+        return @($events | Select-Object TimeCreated, Id)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Get-AgentPresence {
+    $found = @()
+
+    foreach ($pattern in $Script:AgentServicePattern) {
+        $svc = Get-Service -Name $pattern -ErrorAction SilentlyContinue
+        if ($svc) { $found += $svc }
+    }
+
+    return @($found | Sort-Object -Property Name -Unique)
+}
+
+#endregion
+
+#region Test artifacts --------------------------------------------------------
+
+function New-EicarArtifact {
+    # Writes the 68-byte EICAR string with no BOM and no trailing newline.
+    # Assembled from fragments so this script does not match the signature.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $p1 = 'X5O!P%@AP[4\PZX54(P^)7CC)7}'
+    $p2 = '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!'
+    $p3 = '$H+H*'
+
+    $encoding = New-Object System.Text.ASCIIEncoding
+    [System.IO.File]::WriteAllText($Path, ($p1 + $p2 + $p3), $encoding)
+
+    $size = (Get-Item -LiteralPath $Path).Length
+    if ($size -ne 68) {
+        throw "EICAR artifact is $size bytes, expected 68. Encoding problem."
+    }
+}
+
+function New-TestArtifactSet {
+    # Four escalating variants:
+    #   eicar.com       raw
+    #   eicar.com.txt   benign extension, identical bytes
+    #   eicar_com.zip   one archive layer
+    #   eicar_com2.zip  two archive layers
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $staging = Join-Path $Directory 'staging'
+    New-Item -Path $staging -ItemType Directory -Force | Out-Null
+
+    $rawCom = Join-Path $staging 'eicar.com'
+    New-EicarArtifact -Path $rawCom
+
+    $zip1 = Join-Path $staging 'eicar_com.zip'
+    Compress-Archive -LiteralPath $rawCom -DestinationPath $zip1 -Force
+
+    $zip2 = Join-Path $staging 'eicar_com2.zip'
+    Compress-Archive -LiteralPath $zip1 -DestinationPath $zip2 -Force
+
+    $artifacts = [ordered]@{
+        'eicar.com'      = Join-Path $Directory 'eicar.com'
+        'eicar.com.txt'  = Join-Path $Directory 'eicar.com.txt'
+        'eicar_com.zip'  = Join-Path $Directory 'eicar_com.zip'
+        'eicar_com2.zip' = Join-Path $Directory 'eicar_com2.zip'
+    }
+
+    Copy-Item -LiteralPath $rawCom -Destination $artifacts['eicar.com']     -Force
+    Copy-Item -LiteralPath $rawCom -Destination $artifacts['eicar.com.txt'] -Force
+    Copy-Item -LiteralPath $zip1   -Destination $artifacts['eicar_com.zip'] -Force
+    Copy-Item -LiteralPath $zip2   -Destination $artifacts['eicar_com2.zip'] -Force
+
+    Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+
+    return $artifacts
+}
+
+#endregion
+
+#region Modes -----------------------------------------------------------------
+
+function Invoke-DiscoverMode {
+    Write-Log '--- Discover: AV stack inventory (read-only) ---'
+
+    $registered = Get-RegisteredAvProduct
+
+    if ($registered.Count -eq 0) {
+        Write-Log 'No products registered with Windows Security Center.' -Level WARN
+    }
+    else {
+        foreach ($p in $registered) {
+            $stateHex = '{0:X}' -f $p.productState
+            Write-Log "Registered AV: $($p.displayName) (productState 0x$stateHex)"
+        }
+    }
+
+    $thirdParty = @($registered | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' })
+
+    if ($thirdParty.Count -gt 0) {
+        $names = ($thirdParty | ForEach-Object { $_.displayName }) -join ', '
+        Write-Log "Third-party AV registered: $names. Defender should be passive."
+    }
+    else {
+        Write-Log 'Only Defender is registered with Security Center. Defender will win commodity-signature races against any agent that does not register.' -Level WARN
+    }
+
+    $defender = Get-DefenderStatus
+    Write-Log "Defender present: $($defender.Present) | RealTime: $($defender.RealTimeEnabled) | RunningMode: $($defender.RunningMode) | TamperProtected: $($defender.TamperProtected)"
+
+    if ($defender.TamperProtected -eq $true) {
+        Write-Log 'Tamper Protection is ON. Local exclusion writes may be silently rejected; push the exclusion via policy instead.' -Level WARN
+    }
+
+    $agents = Get-AgentPresence
+
+    if ($agents.Count -gt 0) {
+        foreach ($a in $agents) {
+            Write-Log "Agent service: $($a.Name) [$($a.Status)]"
+        }
+    }
+    else {
+        Write-Log 'No Iru/Kandji agent service matched. Update the AgentServicePattern value if the service name differs.' -Level WARN
+    }
+
+    $pathExists = Test-Path -LiteralPath $TestPath
+    Write-Log "Test path: $TestPath (exists: $pathExists)"
+
+    $exclusionPresent = Test-ExclusionPresent -Path $TestPath
+    Write-Log "Exclusion in place: $exclusionPresent"
+
+    $lastRun = Get-State -Name 'LastRun'
+    Write-Log "Last run: $lastRun"
+
+    return $Script:ExitCompliant
+}
+
+function Invoke-AuditMode {
+    $today   = (Get-Date).ToString('yyyy-MM-dd')
+    $lastRun = Get-State -Name 'LastRun'
+
+    if ($lastRun -eq $today) {
+        Write-Log "EDR file-detection test already ran $today; compliant."
+        return $Script:ExitCompliant
+    }
+
+    Write-Log "EDR file-detection test not yet run for $today; remediation required."
+    return $Script:ExitNonCompliant
+}
+
+function Invoke-EnforceMode {
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    # Stamped before the artifacts are written. If the EDR response is aggressive
+    # enough to terminate this process, the daily gate still holds and the test
+    # does not re-fire on every check-in.
+    Set-State -Name 'LastRun' -Value $today
+    Write-Log "Stamped run date: $today"
+
+    New-Item -Path $TestPath -ItemType Directory -Force | Out-Null
+    Set-State -Name 'TestPath' -Value $TestPath
+
+    if ($SkipExclusion) {
+        Write-Log 'SkipExclusion set. Defender will see these writes. Expect Defender to win.' -Level WARN
+    }
+    else {
+        if (-not (Add-TestExclusion -Path $TestPath)) {
+            Write-Log 'Proceeding without an exclusion. Results will reflect Defender, not Iru.' -Level WARN
+        }
+    }
+
+    Write-Log 'Generating test artifacts'
+    $artifacts = New-TestArtifactSet -Directory $TestPath
+
+    foreach ($name in $artifacts.Keys) {
+        if (Test-Path -LiteralPath $artifacts[$name]) {
+            $size = (Get-Item -LiteralPath $artifacts[$name]).Length
+            Write-Log "  wrote $name ($size bytes)"
+        }
+        else {
+            Write-Log "  wrote $name (already removed)"
+        }
+    }
+
+    Write-Log "Waiting $SettleSeconds seconds for scanners to act"
+    Start-Sleep -Seconds $SettleSeconds
+
+    Write-Log '--- Results ---'
+    $quarantined = 0
+
+    foreach ($name in $artifacts.Keys) {
+        if (Test-Path -LiteralPath $artifacts[$name]) {
+            Write-Log "  SURVIVED  $name"
+        }
+        else {
+            Write-Log "  REMOVED   $name"
+            $quarantined++
+        }
+    }
+
+    $defenderEvents = Get-RecentDefenderDetection -MinutesBack 10
+
+    if ($defenderEvents.Count -gt 0) {
+        Write-Log "Defender logged $($defenderEvents.Count) detection event(s) in the last 10 minutes. Attribution is ambiguous." -Level WARN
+        foreach ($e in $defenderEvents) {
+            Write-Log "  Defender event $($e.Id) at $($e.TimeCreated)"
+        }
+    }
+    else {
+        Write-Log 'No Defender detection events in the last 10 minutes.'
+    }
+
+    if ($quarantined -eq 0) {
+        Write-Log 'Nothing was removed. Either Iru EDR did not detect these artifacts, or its response posture is set to alert-only rather than quarantine.' -Level WARN
+    }
+    elseif ($defenderEvents.Count -eq 0) {
+        Write-Log "$quarantined of $($artifacts.Count) artifacts removed with no Defender activity. Attributable to Iru EDR."
+    }
+
+    Write-Log 'Confirm the corresponding detections in the Iru console Threats view before treating this as a pass.'
+    Write-Log 'Enforce complete.'
+
+    return $Script:ExitCompliant
+}
+
+function Invoke-RevertMode {
+    Write-Log '--- Revert ---'
+
+    $recorded = Get-State -Name 'TestPath'
+    if ($recorded) { $target = $recorded } else { $target = $TestPath }
+
+    Remove-TestExclusion -Path $target
+
+    if (Test-Path -LiteralPath $target) {
+        try {
+            Remove-Item -LiteralPath $target -Recurse -Force
+            Write-Log "Removed test directory $target"
+        }
+        catch {
+            Write-Log "Could not fully remove $target - $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    Remove-State
+    Write-Log 'Revert complete.'
+
+    return $Script:ExitCompliant
+}
+
+#endregion
+
+#region Main ------------------------------------------------------------------
+
+try {
+    Write-Log "=== $($Script:ScriptName) starting | Mode: $Mode | User: $env:USERNAME ==="
+
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Log 'Must run elevated or as SYSTEM.' -Level ERROR
+        exit $Script:ExitError
+    }
+
+    $code = $Script:ExitError
+
+    switch ($Mode) {
+        'Audit'    { $code = Invoke-AuditMode }
+        'Enforce'  { $code = Invoke-EnforceMode }
+        'Discover' { $code = Invoke-DiscoverMode }
+        'Revert'   { $code = Invoke-RevertMode }
+    }
+
+    Write-Log "=== $($Script:ScriptName) finished | Exit: $code ==="
+    exit $code
+}
+catch {
+    Write-Log "Unhandled error: $($_.Exception.Message)" -Level ERROR
+    Write-Log "$($_.ScriptStackTrace)" -Level ERROR
+    exit $Script:ExitError
+}
+
+#endregion
