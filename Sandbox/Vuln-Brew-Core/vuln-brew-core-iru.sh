@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# vuln-brew-core.sh
+# vuln-brew-core-iru.sh  (MDM / IRU DEPLOYMENT)
 # Installs pinned OLD Homebrew formulae from homebrew/core under their
 # CANONICAL names, so each keg's INSTALL_RECEIPT.json records
 # source.tap = homebrew/core (normal provenance the Iru agent reports on).
@@ -12,9 +12,14 @@
 # - Non-interactive: no y/n prompts.
 # - Idempotent: re-running skips what's already installed.
 #
-# Run as your normal user (NOT root).
+# EXECUTION CONTEXT:
+#   The Iru agent runs library items as root, but Homebrew refuses to run as
+#   root. This script detects the root context, resolves the logged-in console
+#   user, and re-executes itself as that user. It therefore requires an active
+#   console session; if no one is logged in it exits 1 and retries next check-in.
+#   Run by hand it also works: as a normal user it skips the drop and proceeds.
 
-# ── pinned versions:  name|homebrew-core commit that set that version ──
+# -- pinned versions:  name|homebrew-core commit that set that version --
 PINS=(
   "libpng|f0c1d45"
   "libpcap|20bc25d"
@@ -24,20 +29,36 @@ PINS=(
   "gradle|dfb86557fa8"
 )
 
-# ── sanity ──
-if [ "$(id -u)" -eq 0 ]; then echo "ERROR: run as your user, not root." >&2; exit 1; fi
-command -v brew >/dev/null 2>&1 || { echo "ERROR: brew not on PATH." >&2; exit 1; }
+# -- run-as-user: drop from root (Iru context) to the console user --
+# The script is fed back in over stdin, whose fd is opened by root before the
+# privilege drop, so this works even if the agent's temp copy of the script is
+# not readable by the console user.
+if [ "$(id -u)" -eq 0 ]; then
+  CONSOLE_USER=$(/usr/bin/stat -f%Su /dev/console)
+  case "$CONSOLE_USER" in
+    ""|root|loginwindow|_*)
+      echo "ERROR: no console user is logged in; Homebrew cannot run. Will retry on next check-in." >&2
+      exit 1
+      ;;
+  esac
+  echo "==> Iru launched this as root; re-executing as console user '$CONSOLE_USER'."
+  exec /usr/bin/sudo -u "$CONSOLE_USER" -H /bin/bash -s -- "$@" < "$0"
+fi
 
-[ "$(uname -m)" = "arm64" ] && CELLAR="/opt/homebrew/Cellar" || CELLAR="/usr/local/Cellar"
+# -- sanity --
+if [ "$(uname -m)" = "arm64" ]; then BREW_PREFIX="/opt/homebrew"; else BREW_PREFIX="/usr/local"; fi
+export PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:$PATH"   # non-login shell has no brew shellenv
+CELLAR="$BREW_PREFIX/Cellar"
+command -v brew >/dev/null 2>&1 || { echo "ERROR: brew not on PATH ($BREW_PREFIX/bin)." >&2; exit 1; }
 
-# ── env: stop brew from resetting the tap, drifting versions, or prompting ──
+# -- env: stop brew from resetting the tap, drifting versions, or prompting --
 export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_INSTALL_FROM_API=1          # use the checked-out old formula
 export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 # <- prevents the gradle-style drift
 export HOMEBREW_NO_INSTALL_CLEANUP=1
 export HOMEBREW_NO_ENV_HINTS=1
 
-# ── ensure homebrew/core clone is present (checkout reads its git history) ──
+# -- ensure homebrew/core clone is present (checkout reads its git history) --
 CORE="$(brew --repository homebrew/core)"
 if [ ! -d "$CORE/Formula" ]; then
   echo "==> Cloning homebrew/core (one-time, ~1.4GB)..."
@@ -51,7 +72,7 @@ install_pinned() {
   echo "==> $name  (rev $rev)"
 
   if brew list --versions "$name" >/dev/null 2>&1; then
-    echo "    already installed — skipping"; return 0
+    echo "    already installed - skipping"; return 0
   fi
 
   # resolve the sharded formula path AT that revision (unique match only)
@@ -83,9 +104,9 @@ done
 # leave the core tap clean, not sitting on old checkouts
 git -C "$CORE" restore . 2>/dev/null || true
 
-# ── summary + provenance (this is the part to show the dev team) ──
+# -- summary + provenance (this is the part to show the dev team) --
 echo
-echo "──────────── SUMMARY ────────────"
+echo "------------ SUMMARY ------------"
 echo "OK     : ${ok[*]:-none}"
 echo "FAILED : ${bad[*]:-none}"
 echo
@@ -99,4 +120,4 @@ for n in libpng libpcap git openssl@3 python@3.13 gradle; do
     echo "  $n   MISSING"
   fi
 done
-echo "──────────────────────────────────"
+echo "----------------------------------"
