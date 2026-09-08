@@ -53,13 +53,14 @@
     File     : Manage-WindowsLaps.ps1
     Version  : 1.0.0 (2026-09-08)
     Repo     : github.com/sebastian-gogola/WindowsScripts
+    Target   : Windows 11 24H2 (build 26100) or later - the minimum Iru supports
     Runs as  : SYSTEM or local Administrator (elevation required)
     PS       : Windows PowerShell 5.1 (no external modules)
 
     Exit codes:
       0 = success / compliant
       1 = drift detected (Audit) or a runtime failure during Enforce/Revert
-      2 = precondition failure (not elevated, OS lacks Windows LAPS, invalid
+      2 = precondition failure (not elevated, unsupported OS build, invalid
           configuration, or join state incompatible with BackupDirectory)
 
     Sources: see the accompanying README.md (Sourcing notes section).
@@ -100,8 +101,8 @@ $BackupDirectory = 1
 # Name of the managed local administrator account.
 # $null   = manage the built-in administrator account, located by its well-known
 #           RID (correct even where the account has been renamed or localized).
-# 'Name'  = manage that account instead. Windows LAPS does NOT create it - it
-#           must already exist (see ../CreateLocalAdmin/).
+# 'Name'  = manage that account instead. Windows LAPS does NOT create it - the
+#           account must already exist on the device.
 $AdministratorAccountName = $null
 
 # Maximum password age in days. Range 1-365, but the minimum is 7 when backing
@@ -113,10 +114,10 @@ $PasswordAgeDays = 30
 #   2 = large + small letters
 #   3 = large + small letters + numbers
 #   4 = large + small + numbers + special characters   (Microsoft recommends 4)
-#   5 = as 4, improved readability          | Windows 11 24H2 / Server 2025+
-#   6 = passphrase (long words)             | Windows 11 24H2 / Server 2025+
-#   7 = passphrase (short words)            | Windows 11 24H2 / Server 2025+
-#   8 = passphrase (short words, unique prefixes) | Windows 11 24H2 / Server 2025+
+#   5 = as 4, improved readability
+#   6 = passphrase (long words)
+#   7 = passphrase (short words)
+#   8 = passphrase (short words, unique prefixes)
 $PasswordComplexity = 4
 
 # Password length in characters. Range 8-64. Ignored when $PasswordComplexity
@@ -126,7 +127,7 @@ $PasswordComplexity = 4
 $PasswordLength = 20
 
 # Number of words in the passphrase. Range 3-10. Only used when
-# $PasswordComplexity is 6, 7, or 8. Windows 11 24H2 / Server 2025+.
+# $PasswordComplexity is 6, 7, or 8. Windows default: 6.
 $PassphraseLength = $null
 
 # Hours to wait after the managed account authenticates before running the
@@ -138,7 +139,7 @@ $PostAuthenticationResetDelay = 8
 #   1  = reset the password
 #   3  = reset the password and sign the managed account out   (Windows default)
 #   5  = reset the password and reboot the device
-#   11 = reset, sign out, and terminate remaining processes | 24H2 / Server 2025+
+#   11 = reset, sign out, and terminate any remaining processes
 $PostAuthenticationActions = 3
 
 # --- Active Directory only (ignored when $BackupDirectory = 1) ---------------
@@ -159,7 +160,7 @@ $ADPasswordEncryptionPrincipal = $null
 # How many previous encrypted passwords AD keeps. Range 0-12. Windows default: 0.
 $ADEncryptedPasswordHistorySize = $null
 
-# --- Automatic account management (Windows 11 24H2 / Server 2025 and later) --
+# --- Automatic account management --------------------------------------------
 # When enabled, Windows LAPS creates and owns the managed account itself and
 # $AdministratorAccountName is ignored.
 
@@ -221,21 +222,9 @@ $PolicyRootPaths = [ordered]@{
     'LegacyLaps'  = 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd'
 }
 
-# Minimum update revision (UBR) per servicing build that carries Windows LAPS.
-# Builds above the highest entry always include it.
-$LapsMinimumUbr = @{
-    17763 = 4244   # Windows 10 1809
-    19041 = 2784   # Windows 10 2004 servicing family (19041-19045)
-    19042 = 2784
-    19043 = 2784
-    19044 = 2784
-    19045 = 2784
-    20348 = 1663   # Windows Server 2022
-    22000 = 1754   # Windows 11 21H2
-    22621 = 1480   # Windows 11 22H2
-}
-$LapsAlwaysSupportedBuild = 22631   # 23H2 and later shipped with LAPS in-box
-$Build24H2                = 26100   # gate for the newer settings and values
+# Windows 11 24H2 is the minimum OS Iru supports, and it carries every Windows
+# LAPS setting this script can write, so a single build gate covers both.
+$MinimumBuild = 26100   # Windows 11 24H2
 
 $script:FailureCount = 0
 $script:DriftCount   = 0
@@ -283,17 +272,12 @@ function Get-OsBuildInfo {
         Build       = $build
         Ubr         = $ubr
         DisplayName = "$($props.ProductName) $($props.DisplayVersion) ($build.$ubr)"
-        Is24H2Plus  = ($build -ge $Build24H2)
     }
 }
 
 function Test-LapsCapable {
     param([Parameter(Mandatory)]$Os)
-    if ($Os.Build -ge $LapsAlwaysSupportedBuild) { return $true }
-    if ($LapsMinimumUbr.ContainsKey($Os.Build)) {
-        return ($Os.Ubr -ge $LapsMinimumUbr[$Os.Build])
-    }
-    return $false
+    return ($Os.Build -ge $MinimumBuild)
 }
 
 function Get-JoinState {
@@ -329,25 +313,26 @@ function Get-JoinState {
 
 function Get-SettingDefinitions {
     # Type maps the CSP node format onto the registry: int/bool -> REG_DWORD,
-    # chr -> REG_SZ. MinBuild gates settings that only newer releases parse.
+    # chr -> REG_SZ. Every node below is available on Windows 11 24H2, which is
+    # the minimum OS this script supports, so no per-setting OS gate is needed.
     @(
-        [pscustomobject]@{ Name='BackupDirectory';                        Type='DWord';  Data=$BackupDirectory;                        Allowed=@(0,1,2);     Min=$null; Max=$null; MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='AdministratorAccountName';               Type='String'; Data=$AdministratorAccountName;               Allowed=$null;        Min=$null; Max=$null; MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordAgeDays';                        Type='DWord';  Data=$PasswordAgeDays;                        Allowed=$null;        Min=1;     Max=365;   MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordComplexity';                     Type='DWord';  Data=$PasswordComplexity;                     Allowed=@(1,2,3,4,5,6,7,8); Min=$null; Max=$null; MinBuild=0;  AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordLength';                         Type='DWord';  Data=$PasswordLength;                         Allowed=$null;        Min=8;     Max=64;    MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='PassphraseLength';                       Type='DWord';  Data=$PassphraseLength;                       Allowed=$null;        Min=3;     Max=10;    MinBuild=$Build24H2; AdOnly=$false }
-        [pscustomobject]@{ Name='PostAuthenticationResetDelay';           Type='DWord';  Data=$PostAuthenticationResetDelay;           Allowed=$null;        Min=0;     Max=24;    MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='PostAuthenticationActions';              Type='DWord';  Data=$PostAuthenticationActions;              Allowed=@(1,3,5,11);  Min=$null; Max=$null; MinBuild=0;          AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordExpirationProtectionEnabled';    Type='DWord';  Data=$PasswordExpirationProtectionEnabled;    Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=0;          AdOnly=$true  }
-        [pscustomobject]@{ Name='ADPasswordEncryptionEnabled';            Type='DWord';  Data=$ADPasswordEncryptionEnabled;            Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=0;          AdOnly=$true  }
-        [pscustomobject]@{ Name='ADPasswordEncryptionPrincipal';          Type='String'; Data=$ADPasswordEncryptionPrincipal;          Allowed=$null;        Min=$null; Max=$null; MinBuild=0;          AdOnly=$true  }
-        [pscustomobject]@{ Name='ADEncryptedPasswordHistorySize';         Type='DWord';  Data=$ADEncryptedPasswordHistorySize;         Allowed=$null;        Min=0;     Max=12;    MinBuild=0;          AdOnly=$true  }
-        [pscustomobject]@{ Name='AutomaticAccountManagementEnabled';      Type='DWord';  Data=$AutomaticAccountManagementEnabled;      Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=$Build24H2; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementTarget';       Type='DWord';  Data=$AutomaticAccountManagementTarget;       Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=$Build24H2; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementNameOrPrefix'; Type='String'; Data=$AutomaticAccountManagementNameOrPrefix; Allowed=$null;        Min=$null; Max=$null; MinBuild=$Build24H2; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementEnableAccount';Type='DWord';  Data=$AutomaticAccountManagementEnableAccount;Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=$Build24H2; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementRandomizeName';Type='DWord';  Data=$AutomaticAccountManagementRandomizeName;Allowed=@(0,1);       Min=$null; Max=$null; MinBuild=$Build24H2; AdOnly=$false }
+        [pscustomobject]@{ Name='BackupDirectory';                        Type='DWord';  Data=$BackupDirectory;                        Allowed=@(0,1,2);           Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='AdministratorAccountName';               Type='String'; Data=$AdministratorAccountName;               Allowed=$null;              Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='PasswordAgeDays';                        Type='DWord';  Data=$PasswordAgeDays;                        Allowed=$null;              Min=1;     Max=365;   AdOnly=$false }
+        [pscustomobject]@{ Name='PasswordComplexity';                     Type='DWord';  Data=$PasswordComplexity;                     Allowed=@(1,2,3,4,5,6,7,8); Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='PasswordLength';                         Type='DWord';  Data=$PasswordLength;                         Allowed=$null;              Min=8;     Max=64;    AdOnly=$false }
+        [pscustomobject]@{ Name='PassphraseLength';                       Type='DWord';  Data=$PassphraseLength;                       Allowed=$null;              Min=3;     Max=10;    AdOnly=$false }
+        [pscustomobject]@{ Name='PostAuthenticationResetDelay';           Type='DWord';  Data=$PostAuthenticationResetDelay;           Allowed=$null;              Min=0;     Max=24;    AdOnly=$false }
+        [pscustomobject]@{ Name='PostAuthenticationActions';              Type='DWord';  Data=$PostAuthenticationActions;              Allowed=@(1,3,5,11);        Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='PasswordExpirationProtectionEnabled';    Type='DWord';  Data=$PasswordExpirationProtectionEnabled;    Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$true  }
+        [pscustomobject]@{ Name='ADPasswordEncryptionEnabled';            Type='DWord';  Data=$ADPasswordEncryptionEnabled;            Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$true  }
+        [pscustomobject]@{ Name='ADPasswordEncryptionPrincipal';          Type='String'; Data=$ADPasswordEncryptionPrincipal;          Allowed=$null;              Min=$null; Max=$null; AdOnly=$true  }
+        [pscustomobject]@{ Name='ADEncryptedPasswordHistorySize';         Type='DWord';  Data=$ADEncryptedPasswordHistorySize;         Allowed=$null;              Min=0;     Max=12;    AdOnly=$true  }
+        [pscustomobject]@{ Name='AutomaticAccountManagementEnabled';      Type='DWord';  Data=$AutomaticAccountManagementEnabled;      Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='AutomaticAccountManagementTarget';       Type='DWord';  Data=$AutomaticAccountManagementTarget;       Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='AutomaticAccountManagementNameOrPrefix'; Type='String'; Data=$AutomaticAccountManagementNameOrPrefix; Allowed=$null;              Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='AutomaticAccountManagementEnableAccount';Type='DWord';  Data=$AutomaticAccountManagementEnableAccount;Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='AutomaticAccountManagementRandomizeName';Type='DWord';  Data=$AutomaticAccountManagementRandomizeName;Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
     )
 }
 
@@ -358,7 +343,6 @@ function Test-Configuration {
     # anything Windows simply ignores is a warning.
     param(
         [Parameter(Mandatory)]$Settings,
-        [Parameter(Mandatory)]$Os,
         [Parameter(Mandatory)]$Join
     )
     $ok = $true
@@ -366,11 +350,6 @@ function Test-Configuration {
     foreach ($s in $Settings) {
         if ($null -eq $s.Data) { continue }
 
-        if ($s.MinBuild -gt 0 -and $Os.Build -lt $s.MinBuild) {
-            Write-Log "$($s.Name) requires build $($s.MinBuild) or later; this device is $($Os.Build). Leave it `$null on this OS." 'ERROR'
-            $ok = $false
-            continue
-        }
         if ($s.Type -eq 'String') {
             if ([string]::IsNullOrWhiteSpace([string]$s.Data)) {
                 Write-Log "$($s.Name) is set to an empty string. Use `$null for Not Configured." 'ERROR'
@@ -430,10 +409,6 @@ function Test-Configuration {
     }
 
     if ($null -ne $PasswordComplexity) {
-        if ($PasswordComplexity -ge 5 -and -not $Os.Is24H2Plus) {
-            Write-Log "PasswordComplexity = $PasswordComplexity requires Windows 11 24H2 / Server 2025 (build $Build24H2) or later; this device is $($Os.Build) and would silently fall back to the default of 4." 'ERROR'
-            $ok = $false
-        }
         if ($PasswordComplexity -ge 6) {
             if ($null -ne $PasswordLength) {
                 Write-Log 'PasswordComplexity selects a passphrase (6-8), so PasswordLength is ignored. Configure PassphraseLength instead.' 'WARN'
@@ -444,10 +419,6 @@ function Test-Configuration {
         }
     }
 
-    if ($null -ne $PostAuthenticationActions -and $PostAuthenticationActions -eq 11 -and -not $Os.Is24H2Plus) {
-        Write-Log "PostAuthenticationActions = 11 requires Windows 11 24H2 / Server 2025 (build $Build24H2) or later; this device is $($Os.Build)." 'ERROR'
-        $ok = $false
-    }
     if ($null -ne $PostAuthenticationResetDelay -and $PostAuthenticationResetDelay -eq 0) {
         Write-Log 'PostAuthenticationResetDelay = 0 disables all post-authentication actions - the password will not be rotated after the managed account is used.' 'WARN'
     }
@@ -458,7 +429,7 @@ function Test-Configuration {
             $ok = $false
         }
         if (-not (Test-LocalAccountExists -Name $AdministratorAccountName)) {
-            Write-Log "AdministratorAccountName '$AdministratorAccountName' does not exist on this device. Windows LAPS does not create accounts - create it first (see ../CreateLocalAdmin/) or leave the setting `$null to manage the built-in administrator." 'ERROR'
+            Write-Log "AdministratorAccountName '$AdministratorAccountName' does not exist on this device. Windows LAPS does not create accounts - create it first, or leave the setting `$null to manage the built-in administrator." 'ERROR'
             $ok = $false
         }
         if ($null -ne $AutomaticAccountManagementEnabled -and $AutomaticAccountManagementEnabled -eq 1) {
@@ -739,8 +710,7 @@ function Invoke-Discover {
 
     Write-Log '=== DISCOVER: Windows LAPS capability and current state ==='
     Write-Log "OS                  : $($Os.DisplayName)"
-    Write-Log "LAPS capable        : $(Test-LapsCapable -Os $Os)"
-    Write-Log "24H2+ settings      : $($Os.Is24H2Plus)"
+    Write-Log "Supported build     : $(Test-LapsCapable -Os $Os) (minimum $MinimumBuild - Windows 11 24H2)"
     Write-Log "LAPS PS module      : $(Test-LapsModuleAvailable)"
     Write-Log "Join state          : DomainJoined=$($Join.DomainJoined) EntraJoined=$($Join.EntraJoined) Hybrid=$($Join.Hybrid) Workgroup=$($Join.Workgroup)"
 
@@ -843,7 +813,7 @@ if (-not (Test-IsElevated)) {
 
 $os = Get-OsBuildInfo
 if (-not (Test-LapsCapable -Os $os)) {
-    Write-Log "Windows LAPS is not present on this build ($($os.DisplayName)). It requires the April 11 2023 update or later on Windows 10 1809+/11 21H2+/Server 2022, and ships in-box from Windows 11 23H2 onward." 'ERROR'
+    Write-Log "Unsupported OS ($($os.DisplayName)). This script targets Windows 11 24H2 (build $MinimumBuild) or later, which is also the minimum Iru supports." 'ERROR'
     exit 2
 }
 
@@ -860,14 +830,14 @@ $policyPath = $PolicyRootPaths[$PolicyRoot]
 
 switch ($Mode) {
     'Enforce' {
-        if (-not (Test-Configuration -Settings $settings -Os $os -Join $join)) {
+        if (-not (Test-Configuration -Settings $settings -Join $join)) {
             Write-Log 'Configuration is not valid for this device - nothing was written.' 'ERROR'
             exit 2
         }
         Invoke-Enforce -Settings $settings -Path $policyPath
     }
     'Audit' {
-        if (-not (Test-Configuration -Settings $settings -Os $os -Join $join)) {
+        if (-not (Test-Configuration -Settings $settings -Join $join)) {
             Write-Log 'Configuration is not valid for this device - the audit cannot be trusted.' 'ERROR'
             exit 2
         }
