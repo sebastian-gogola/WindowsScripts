@@ -15,6 +15,7 @@ Experimental helper scripts, provided as-is, without warranty or official Iru su
 | [`Manage-DeviceName/`](./Manage-DeviceName/) | Renames devices to match a configurable token-based naming template (serial, asset tag, chassis, random digits), replicating the Intune Autopilot device name template and Rename device action. |
 | [`Manage-UsbStorageRestrictions/`](./Manage-UsbStorageRestrictions/) | Blocks USB mass storage while keeping non-storage USB peripherals functional, with a device-instance-ID allowlist. Replicates the Intune Device Installation restriction policies. |
 | [`Manage-WindowsHelloforBusiness/`](./Manage-WindowsHelloforBusiness/) | Manages Windows Hello for Business policy via GPO-equivalent registry keys, replicating the Intune WHfB settings catalog category. Audit and Enforce modes. |
+| [`Manage-WindowsLaps/`](./Manage-WindowsLaps/) | Enables Windows LAPS by writing the LAPS CSP policy root, so Entra-joined devices rotate and back up the local admin password to Microsoft Entra ID without Intune. Audit/Enforce/Discover/Revert, with LAPS event-log verification. |
 | [`SetLocalAdminPassword/`](./SetLocalAdminPassword/) | LAPS-style local admin password rotation: generates a random password, sets it on the local admin account, and stores it in the device's notes via the Iru API. |
 
 ## Documentation only — `CustomApps/`
