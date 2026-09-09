@@ -15,21 +15,25 @@
 
         HKLM\SOFTWARE\Microsoft\Policies\LAPS
 
-    Windows LAPS evaluates that root first, ahead of the LAPS GPO root, the
-    local-configuration root, and legacy Microsoft LAPS. Writing the CSP root
-    from a SYSTEM-context script therefore produces the same policy state an
+    Windows LAPS evaluates that root ahead of every other LAPS policy root, so
+    writing it from a SYSTEM-context script produces the same policy state an
     Intune LAPS profile produces, and Windows reports "Policy source: CSP" in
     the 10022 policy event. Microsoft documents this path explicitly for
     Entra-joined devices that are not managed by Intune ("you must deploy policy
     manually (for example, either by using direct registry modification or by
     using Local Computer Group Policy)").
 
-    Once BackupDirectory is set, Windows LAPS itself owns the whole lifecycle -
-    generating the password, rotating it on schedule, backing it up to Entra ID
-    over HTTPS with the device identity, and blocking anyone else from changing
-    the managed account's password. The password is retrieved from the Entra
-    admin center, Microsoft Graph, or Get-LapsAADPassword. Nothing about that
-    path routes through Iru.
+    Backup to Microsoft Entra ID is the only supported target here. Iru is a
+    cloud MDM with no Active Directory story, so the CSP's AD-only settings
+    (BackupDirectory = 2, AD password encryption, expiration protection,
+    encrypted password history) are deliberately not implemented.
+
+    Windows LAPS then owns the whole lifecycle - generating the password,
+    rotating it on schedule, backing it up to Entra ID over HTTPS with the
+    device identity, and blocking anyone else from changing the managed
+    account's password. The password is retrieved from the Entra admin center,
+    Microsoft Graph, or Get-LapsAADPassword. Nothing about that path routes
+    through Iru.
 
     Settings map 1:1 onto the CSP node names. Each setting has three states:
       <value>  = enforced (value written to the policy root)
@@ -60,8 +64,8 @@
     Exit codes:
       0 = success / compliant
       1 = drift detected (Audit) or a runtime failure during Enforce/Revert
-      2 = precondition failure (not elevated, unsupported OS build, invalid
-          configuration, or join state incompatible with BackupDirectory)
+      2 = precondition failure (not elevated, unsupported OS build, device not
+          Entra joined, or invalid configuration)
 
     Sources: see the accompanying README.md (Sourcing notes section).
 #>
@@ -91,12 +95,7 @@ $Mode = 'Enforce'
 #                   a LAPS GPO would win over it. Use only for lab validation.
 $PolicyRoot = 'CSP'
 
-# --- Core settings (apply to both Entra ID and Active Directory backup) ------
-
-# Where the password is backed up.
-#   0 = Disabled (no backup)   1 = Microsoft Entra ID only   2 = Active Directory only
-# 1 requires the device to be Entra joined; 2 requires AD domain join.
-$BackupDirectory = 1
+# --- Password policy ---------------------------------------------------------
 
 # Name of the managed local administrator account.
 # $null   = manage the built-in administrator account, located by its well-known
@@ -105,8 +104,8 @@ $BackupDirectory = 1
 #           account must already exist on the device.
 $AdministratorAccountName = $null
 
-# Maximum password age in days. Range 1-365, but the minimum is 7 when backing
-# up to Entra ID. Windows default: 30.
+# Maximum password age in days. Range 7-365 when backing up to Entra ID.
+# Windows default: 30.
 $PasswordAgeDays = 30
 
 # Password composition.
@@ -141,24 +140,6 @@ $PostAuthenticationResetDelay = 8
 #   5  = reset the password and reboot the device
 #   11 = reset, sign out, and terminate any remaining processes
 $PostAuthenticationActions = 3
-
-# --- Active Directory only (ignored when $BackupDirectory = 1) ---------------
-
-# Enforce the maximum password age against the stored expiration timestamp.
-# 1 = enabled, 0 = disabled. Windows default: 1.
-$PasswordExpirationProtectionEnabled = $null
-
-# Encrypt the password before storing it in AD. Requires domain functional
-# level 2016 or higher. 1 = enabled, 0 = disabled. Windows default: 1.
-$ADPasswordEncryptionEnabled = $null
-
-# User or group allowed to decrypt the AD-stored password. SID string or fully
-# qualified name ('contoso\LAPSAdmins', 'lapsadmins@contoso.com'). No quotes or
-# parentheses. Defaults to the device domain's Domain Admins when unset.
-$ADPasswordEncryptionPrincipal = $null
-
-# How many previous encrypted passwords AD keeps. Range 0-12. Windows default: 0.
-$ADEncryptedPasswordHistorySize = $null
 
 # --- Automatic account management --------------------------------------------
 # When enabled, Windows LAPS creates and owns the managed account itself and
@@ -211,16 +192,24 @@ $ScriptVersion = '1.0.0'
 $StateKey      = 'HKLM:\SOFTWARE\IruScripts\WindowsLaps'
 $LapsLogName   = 'Microsoft-Windows-LAPS/Operational'
 
-# Every LAPS policy root, in the precedence order Windows evaluates them.
-# The first root holding at least one value becomes the active policy; the
-# others are ignored entirely, and settings missing from the winning root take
-# their Windows defaults rather than being inherited from a lower root.
+# The LAPS policy roots that can appear on a cloud-managed device, in the
+# precedence order Windows evaluates them. The first root holding at least one
+# value becomes the active policy; the others are ignored entirely, and settings
+# missing from the winning root take their Windows defaults rather than being
+# inherited from a lower root. Microsoft's fourth root - legacy Microsoft LAPS
+# at HKLM\SOFTWARE\Policies\Microsoft Services\AdmPwd - is AD-only and is not
+# tracked here.
 $PolicyRootPaths = [ordered]@{
     'CSP'         = 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS'
     'GPO'         = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS'
     'LocalConfig' = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
-    'LegacyLaps'  = 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd'
 }
+
+# BackupDirectory is fixed, not configurable: 1 = back the password up to
+# Microsoft Entra ID. 2 (Active Directory) is out of scope, and 0 (disabled) is
+# what Revert achieves properly. It stays in the settings table so Audit still
+# catches anyone changing it on the device.
+$BackupDirectory = 1
 
 # Windows 11 24H2 is the minimum OS Iru supports, and it carries every Windows
 # LAPS setting this script can write, so a single build gate covers both.
@@ -280,31 +269,19 @@ function Test-LapsCapable {
     return ($Os.Build -ge $MinimumBuild)
 }
 
-function Get-JoinState {
-    # Win32_ComputerSystem carries the AD domain membership; dsregcmd carries the
-    # Entra device state. Both are needed to validate BackupDirectory.
-    $partOfDomain = $false
-    try {
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-        $partOfDomain = [bool]$cs.PartOfDomain
-    } catch {
-        Write-Log "Could not query Win32_ComputerSystem: $($_.Exception.Message)" 'WARN'
-    }
-    $entraJoined = $false
+function Test-IsEntraJoined {
+    # Backing up to Entra ID requires a true Entra join. dsregcmd reports
+    # AzureAdJoined : YES for both Entra joined and Entra hybrid joined devices;
+    # Entra registered (workplace joined) devices report NO and do not qualify.
     try {
         $ds = & dsregcmd.exe /status 2>$null
         foreach ($line in $ds) {
-            if ($line -match 'AzureAdJoined\s*:\s*YES') { $entraJoined = $true }
+            if ($line -match 'AzureAdJoined\s*:\s*YES') { return $true }
         }
     } catch {
         Write-Log "dsregcmd /status failed: $($_.Exception.Message)" 'WARN'
     }
-    [pscustomobject]@{
-        DomainJoined = $partOfDomain
-        EntraJoined  = $entraJoined
-        Hybrid       = ($partOfDomain -and $entraJoined)
-        Workgroup    = (-not $partOfDomain -and -not $entraJoined)
-    }
+    return $false
 }
 
 # =============================================================================
@@ -315,24 +292,21 @@ function Get-SettingDefinitions {
     # Type maps the CSP node format onto the registry: int/bool -> REG_DWORD,
     # chr -> REG_SZ. Every node below is available on Windows 11 24H2, which is
     # the minimum OS this script supports, so no per-setting OS gate is needed.
+    # The CSP's AD-only nodes are intentionally absent - see the file header.
     @(
-        [pscustomobject]@{ Name='BackupDirectory';                        Type='DWord';  Data=$BackupDirectory;                        Allowed=@(0,1,2);           Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='AdministratorAccountName';               Type='String'; Data=$AdministratorAccountName;               Allowed=$null;              Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordAgeDays';                        Type='DWord';  Data=$PasswordAgeDays;                        Allowed=$null;              Min=1;     Max=365;   AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordComplexity';                     Type='DWord';  Data=$PasswordComplexity;                     Allowed=@(1,2,3,4,5,6,7,8); Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordLength';                         Type='DWord';  Data=$PasswordLength;                         Allowed=$null;              Min=8;     Max=64;    AdOnly=$false }
-        [pscustomobject]@{ Name='PassphraseLength';                       Type='DWord';  Data=$PassphraseLength;                       Allowed=$null;              Min=3;     Max=10;    AdOnly=$false }
-        [pscustomobject]@{ Name='PostAuthenticationResetDelay';           Type='DWord';  Data=$PostAuthenticationResetDelay;           Allowed=$null;              Min=0;     Max=24;    AdOnly=$false }
-        [pscustomobject]@{ Name='PostAuthenticationActions';              Type='DWord';  Data=$PostAuthenticationActions;              Allowed=@(1,3,5,11);        Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='PasswordExpirationProtectionEnabled';    Type='DWord';  Data=$PasswordExpirationProtectionEnabled;    Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$true  }
-        [pscustomobject]@{ Name='ADPasswordEncryptionEnabled';            Type='DWord';  Data=$ADPasswordEncryptionEnabled;            Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$true  }
-        [pscustomobject]@{ Name='ADPasswordEncryptionPrincipal';          Type='String'; Data=$ADPasswordEncryptionPrincipal;          Allowed=$null;              Min=$null; Max=$null; AdOnly=$true  }
-        [pscustomobject]@{ Name='ADEncryptedPasswordHistorySize';         Type='DWord';  Data=$ADEncryptedPasswordHistorySize;         Allowed=$null;              Min=0;     Max=12;    AdOnly=$true  }
-        [pscustomobject]@{ Name='AutomaticAccountManagementEnabled';      Type='DWord';  Data=$AutomaticAccountManagementEnabled;      Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementTarget';       Type='DWord';  Data=$AutomaticAccountManagementTarget;       Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementNameOrPrefix'; Type='String'; Data=$AutomaticAccountManagementNameOrPrefix; Allowed=$null;              Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementEnableAccount';Type='DWord';  Data=$AutomaticAccountManagementEnableAccount;Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
-        [pscustomobject]@{ Name='AutomaticAccountManagementRandomizeName';Type='DWord';  Data=$AutomaticAccountManagementRandomizeName;Allowed=@(0,1);             Min=$null; Max=$null; AdOnly=$false }
+        [pscustomobject]@{ Name='BackupDirectory';                        Type='DWord';  Data=$BackupDirectory;                        Allowed=@(1);               Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AdministratorAccountName';               Type='String'; Data=$AdministratorAccountName;               Allowed=$null;              Min=$null; Max=$null }
+        [pscustomobject]@{ Name='PasswordAgeDays';                        Type='DWord';  Data=$PasswordAgeDays;                        Allowed=$null;              Min=7;     Max=365   }
+        [pscustomobject]@{ Name='PasswordComplexity';                     Type='DWord';  Data=$PasswordComplexity;                     Allowed=@(1,2,3,4,5,6,7,8); Min=$null; Max=$null }
+        [pscustomobject]@{ Name='PasswordLength';                         Type='DWord';  Data=$PasswordLength;                         Allowed=$null;              Min=8;     Max=64    }
+        [pscustomobject]@{ Name='PassphraseLength';                       Type='DWord';  Data=$PassphraseLength;                       Allowed=$null;              Min=3;     Max=10    }
+        [pscustomobject]@{ Name='PostAuthenticationResetDelay';           Type='DWord';  Data=$PostAuthenticationResetDelay;           Allowed=$null;              Min=0;     Max=24    }
+        [pscustomobject]@{ Name='PostAuthenticationActions';              Type='DWord';  Data=$PostAuthenticationActions;              Allowed=@(1,3,5,11);        Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AutomaticAccountManagementEnabled';      Type='DWord';  Data=$AutomaticAccountManagementEnabled;      Allowed=@(0,1);             Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AutomaticAccountManagementTarget';       Type='DWord';  Data=$AutomaticAccountManagementTarget;       Allowed=@(0,1);             Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AutomaticAccountManagementNameOrPrefix'; Type='String'; Data=$AutomaticAccountManagementNameOrPrefix; Allowed=$null;              Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AutomaticAccountManagementEnableAccount';Type='DWord';  Data=$AutomaticAccountManagementEnableAccount;Allowed=@(0,1);             Min=$null; Max=$null }
+        [pscustomobject]@{ Name='AutomaticAccountManagementRandomizeName';Type='DWord';  Data=$AutomaticAccountManagementRandomizeName;Allowed=@(0,1);             Min=$null; Max=$null }
     )
 }
 
@@ -343,7 +317,7 @@ function Test-Configuration {
     # anything Windows simply ignores is a warning.
     param(
         [Parameter(Mandatory)]$Settings,
-        [Parameter(Mandatory)]$Join
+        [Parameter(Mandatory)][bool]$EntraJoined
     )
     $ok = $true
 
@@ -379,33 +353,9 @@ function Test-Configuration {
 
     # --- Cross-setting rules --------------------------------------------------
 
-    if ($null -eq $BackupDirectory) {
-        Write-Log 'BackupDirectory is Not Configured. Windows defaults it to 0 (Disabled) and every other LAPS setting is ignored. Set it to 1 (Entra ID) or 2 (Active Directory).' 'ERROR'
+    if (-not $EntraJoined) {
+        Write-Log 'This device is not Entra joined (dsregcmd reports AzureAdJoined : NO), so it cannot back a password up to Microsoft Entra ID. Entra-registered/workplace-joined devices do not qualify.' 'ERROR'
         $ok = $false
-    }
-    elseif ($BackupDirectory -eq 0) {
-        Write-Log 'BackupDirectory = 0 (Disabled). No password will be backed up; all other settings are ignored.' 'WARN'
-    }
-    elseif ($BackupDirectory -eq 1) {
-        if (-not $Join.EntraJoined) {
-            Write-Log 'BackupDirectory = 1 backs the password up to Microsoft Entra ID, but this device is not Entra joined (dsregcmd reports AzureAdJoined : NO). Entra-registered/workplace-joined devices do not qualify.' 'ERROR'
-            $ok = $false
-        }
-        if ($null -ne $PasswordAgeDays -and $PasswordAgeDays -lt 7) {
-            Write-Log "PasswordAgeDays = $PasswordAgeDays is below the minimum of 7 days that applies when backing up to Entra ID." 'ERROR'
-            $ok = $false
-        }
-        foreach ($s in $Settings) {
-            if ($s.AdOnly -and $null -ne $s.Data) {
-                Write-Log "$($s.Name) only applies when backing up to Active Directory and will be ignored with BackupDirectory = 1." 'WARN'
-            }
-        }
-    }
-    elseif ($BackupDirectory -eq 2) {
-        if (-not $Join.DomainJoined) {
-            Write-Log 'BackupDirectory = 2 backs the password up to Active Directory, but this device is not domain joined.' 'ERROR'
-            $ok = $false
-        }
     }
 
     if ($null -ne $PasswordComplexity) {
@@ -483,12 +433,8 @@ function Get-PopulatedRoots {
         $props = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
         if ($null -eq $props) { continue }
         $names = @($props.PSObject.Properties |
-            Where-Object { $_.Name -notlike 'PS*' } |
+            Where-Object { $_.Name -notlike 'PS*' -and $known -contains $_.Name } |
             ForEach-Object { $_.Name })
-        # Legacy LAPS uses its own value names, so count any value under that root.
-        if ($rootName -ne 'LegacyLaps') {
-            $names = @($names | Where-Object { $known -contains $_ })
-        }
         if ($names.Count -gt 0) {
             $result += [pscustomobject]@{ Root = $rootName; Path = $path; Values = $names }
         }
@@ -643,8 +589,6 @@ function Invoke-LapsPolicyNow {
 
     if ($events | Where-Object { $_.Id -eq 10029 }) {
         Write-Log 'Confirmed: LAPS backed the password up to Microsoft Entra ID (event 10029).' 'OK'
-    } elseif ($events | Where-Object { $_.Id -eq 10018 }) {
-        Write-Log 'Confirmed: LAPS backed the password up to Active Directory (event 10018).' 'OK'
     } elseif ($events | Where-Object { $_.Id -eq 10004 }) {
         Write-Log 'LAPS policy processing succeeded (event 10004). No password backup was due on this cycle.' 'OK'
     }
@@ -706,13 +650,13 @@ function Invoke-Audit {
 }
 
 function Invoke-Discover {
-    param([Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Os, [Parameter(Mandatory)]$Join)
+    param([Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Os, [Parameter(Mandatory)][bool]$EntraJoined)
 
     Write-Log '=== DISCOVER: Windows LAPS capability and current state ==='
     Write-Log "OS                  : $($Os.DisplayName)"
     Write-Log "Supported build     : $(Test-LapsCapable -Os $Os) (minimum $MinimumBuild - Windows 11 24H2)"
     Write-Log "LAPS PS module      : $(Test-LapsModuleAvailable)"
-    Write-Log "Join state          : DomainJoined=$($Join.DomainJoined) EntraJoined=$($Join.EntraJoined) Hybrid=$($Join.Hybrid) Workgroup=$($Join.Workgroup)"
+    Write-Log "Entra joined        : $EntraJoined"
 
     $populated = Get-PopulatedRoots -Settings $Settings
     if ($populated.Count -eq 0) {
@@ -817,8 +761,8 @@ if (-not (Test-LapsCapable -Os $os)) {
     exit 2
 }
 
-$join     = Get-JoinState
-$settings = Get-SettingDefinitions
+$entraJoined = Test-IsEntraJoined
+$settings    = Get-SettingDefinitions
 
 # Only the CSP and local-configuration roots are writable here. The GPO and
 # legacy roots are owned by Group Policy and are read for reporting only.
@@ -830,20 +774,20 @@ $policyPath = $PolicyRootPaths[$PolicyRoot]
 
 switch ($Mode) {
     'Enforce' {
-        if (-not (Test-Configuration -Settings $settings -Join $join)) {
+        if (-not (Test-Configuration -Settings $settings -EntraJoined $entraJoined)) {
             Write-Log 'Configuration is not valid for this device - nothing was written.' 'ERROR'
             exit 2
         }
         Invoke-Enforce -Settings $settings -Path $policyPath
     }
     'Audit' {
-        if (-not (Test-Configuration -Settings $settings -Join $join)) {
+        if (-not (Test-Configuration -Settings $settings -EntraJoined $entraJoined)) {
             Write-Log 'Configuration is not valid for this device - the audit cannot be trusted.' 'ERROR'
             exit 2
         }
         Invoke-Audit -Settings $settings -Path $policyPath
     }
-    'Discover' { Invoke-Discover -Settings $settings -Os $os -Join $join }
+    'Discover' { Invoke-Discover -Settings $settings -Os $os -EntraJoined $entraJoined }
     'Revert'   { Invoke-Revert -Path $policyPath }
     default    { Write-Log "Unknown mode '$Mode'. Valid: Enforce, Audit, Discover, Revert." 'ERROR' }
 }

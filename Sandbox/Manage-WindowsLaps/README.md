@@ -26,9 +26,10 @@ Microsoft gives **each LAPS policy mechanism its own registry root** and evaluat
 | 1 | **LAPS CSP** | `HKLM\SOFTWARE\Microsoft\Policies\LAPS` |
 | 2 | LAPS Group Policy | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS` |
 | 3 | LAPS Local Configuration | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config` |
-| 4 | Legacy Microsoft LAPS | `HKLM\SOFTWARE\Policies\Microsoft Services\AdmPwd` |
 
 Windows walks that list top-down; **the first root holding at least one value becomes the active policy** and every lower root is ignored outright. The script writes root #1 — the CSP's own store — so the resulting policy state is identical to what an Intune LAPS profile produces, at the same precedence, and Windows reports `Policy source: CSP` in its 10022 policy event.
+
+Microsoft documents a fourth root below these — legacy Microsoft LAPS at `HKLM\SOFTWARE\Policies\Microsoft Services\AdmPwd`. It is an Active Directory mechanism, so it is out of scope here and the script does not report on it.
 
 Microsoft documents this path explicitly for this exact scenario: *"If your devices are Microsoft Entra joined but you're not using Microsoft Intune, you can still deploy Windows LAPS for Microsoft Entra ID. In this scenario, you must deploy policy manually (for example, either by using direct registry modification or by using Local Computer Group Policy)."*
 
@@ -56,17 +57,17 @@ Every configuration variable is the CSP node name, written verbatim as the regis
 | Passphrase Length | `PassphraseLength` | `PassphraseLength` | REG_DWORD |
 | Post Authentication Reset Delay | `PostAuthenticationResetDelay` | `PostAuthenticationResetDelay` | REG_DWORD |
 | Post Authentication Actions | `PostAuthenticationActions` | `PostAuthenticationActions` | REG_DWORD |
-| Password Expiration Protection Enabled | `PasswordExpirationProtectionEnabled` | `PasswordExpirationProtectionEnabled` | REG_DWORD |
-| AD Password Encryption Enabled | `ADPasswordEncryptionEnabled` | `ADPasswordEncryptionEnabled` | REG_DWORD |
-| AD Password Encryption Principal | `ADPasswordEncryptionPrincipal` | `ADPasswordEncryptionPrincipal` | REG_SZ |
-| AD Encrypted Password History Size | `ADEncryptedPasswordHistorySize` | `ADEncryptedPasswordHistorySize` | REG_DWORD |
 | Automatic Account Management Enabled | `AutomaticAccountManagementEnabled` | `AutomaticAccountManagementEnabled` | REG_DWORD |
 | Automatic Account Management Target | `AutomaticAccountManagementTarget` | `AutomaticAccountManagementTarget` | REG_DWORD |
 | Automatic Account Management Name Or Prefix | `AutomaticAccountManagementNameOrPrefix` | `AutomaticAccountManagementNameOrPrefix` | REG_SZ |
 | Automatic Account Management Enable Account | `AutomaticAccountManagementEnableAccount` | `AutomaticAccountManagementEnableAccount` | REG_DWORD |
 | Automatic Account Management Randomize Name | `AutomaticAccountManagementRandomizeName` | `AutomaticAccountManagementRandomizeName` | REG_DWORD |
 
-Every node above is available on Windows 11 24H2 and later, so there is no per-setting OS gate — the whole CSP surface is usable across the supported fleet, including the passphrase complexities, `PassphraseLength`, post-authentication action 11, and automatic account management.
+That is the complete set of LAPS CSP nodes that apply when backing up to Microsoft Entra ID. Every one of them is available on Windows 11 24H2 and later, so there is no per-setting OS gate — the whole surface is usable across the supported fleet, including the passphrase complexities, `PassphraseLength`, post-authentication action 11, and automatic account management.
+
+**`BackupDirectory` is fixed at `1` (Entra ID) and is not a configuration variable.** It is still written and still audited, so tampering on the device is caught, but there is nothing to choose: `2` is Active Directory, and `0` (disabled) is what `Revert` achieves properly.
+
+**The CSP's Active Directory nodes are deliberately not implemented** — `PasswordExpirationProtectionEnabled`, `ADPasswordEncryptionEnabled`, `ADPasswordEncryptionPrincipal`, and `ADEncryptedPasswordHistorySize`. Microsoft's own applicability table marks all four as *not applicable* when `BackupDirectory` is Entra ID, so on this fleet they would be inert values in the registry and dead branches in the script.
 
 The CSP's `Actions/ResetPassword` and `Actions/ResetPasswordStatus` nodes have no registry equivalent. Their local equivalents are the in-box `Reset-LapsPassword` cmdlet (exposed here as `$RotateNow`) and the LAPS event log.
 
@@ -76,7 +77,7 @@ Registry value **names** and **semantics** are vendor-documented; the DWORD/SZ *
 
 ## Prerequisites
 
-**1. Enable LAPS in the Entra tenant.** By default Entra ID rejects password backups. In the Microsoft Entra admin center: **Identity → Devices → Overview → Device settings → Enable Microsoft Entra Local Administrator Password Solution (LAPS) → Yes → Save**. Requires Cloud Device Administrator or higher. Devices that are Entra **hybrid** joined and back up to AD (`BackupDirectory = 2`) do not need this.
+**1. Enable LAPS in the Entra tenant.** By default Entra ID rejects password backups. In the Microsoft Entra admin center: **Identity → Devices → Overview → Device settings → Enable Microsoft Entra Local Administrator Password Solution (LAPS) → Yes → Save**. Requires Cloud Device Administrator or higher.
 
 **2. Devices must be Entra joined.** `dsregcmd /status` must report `AzureAdJoined : YES`. Entra *registered* (workplace-joined, BYOD) devices do not qualify — the script blocks these with exit 2 rather than writing a policy that can never succeed.
 
@@ -94,18 +95,13 @@ Registry value **names** and **semantics** are vendor-documented; the DWORD/SZ *
 |---|---|---|
 | `$Mode` | `'Enforce'` | `Enforce` \| `Audit` \| `Discover` \| `Revert` |
 | `$PolicyRoot` | `'CSP'` | `CSP` (production) or `LocalConfig` (lab only, lowest precedence) |
-| `$BackupDirectory` | `1` | `0` disabled · `1` Entra ID · `2` Active Directory |
 | `$AdministratorAccountName` | `$null` | `$null` = built-in administrator by well-known RID |
-| `$PasswordAgeDays` | `30` | 1–365; **minimum 7 with Entra backup** |
+| `$PasswordAgeDays` | `30` | 7–365 (7 is the Entra ID minimum) |
 | `$PasswordComplexity` | `4` | `1`–`4` character classes · `5` improved readability · `6`–`8` passphrase |
 | `$PasswordLength` | `20` | 8–64; ignored for passphrase complexities |
 | `$PassphraseLength` | `$null` | 3–10 words; only with complexity 6–8 |
 | `$PostAuthenticationResetDelay` | `8` | Hours 0–24; `0` disables post-auth actions entirely |
 | `$PostAuthenticationActions` | `3` | `1` reset · `3` reset + sign out · `5` reset + reboot · `11` reset + sign out + kill processes |
-| `$PasswordExpirationProtectionEnabled` | `$null` | AD backup only |
-| `$ADPasswordEncryptionEnabled` | `$null` | AD backup only; needs DFL 2016+ |
-| `$ADPasswordEncryptionPrincipal` | `$null` | AD backup only; SID or fully qualified name, no quotes |
-| `$ADEncryptedPasswordHistorySize` | `$null` | AD backup only; 0–12 |
 | `$AutomaticAccountManagement*` | `$null` | LAPS creates and owns the managed account itself |
 | `$ApplyPolicyImmediately` | `$true` | Runs `Invoke-LapsPolicyProcessing` after writing, instead of waiting for the hourly cycle |
 | `$VerifyBackupSeconds` | `45` | How long to wait before reading the LAPS event log for the outcome; `0` skips |
@@ -120,9 +116,9 @@ Registry value **names** and **semantics** are vendor-documented; the DWORD/SZ *
 
 ### Capturing environment-specific values
 
-Run once with `$Mode = 'Discover'` on a representative device before rollout. It prints the OS build and whether it clears the supported floor, whether the LAPS PowerShell module is present, the join state, **every LAPS policy root that currently holds values** (with the winning one called out), which values this script owns, and the last 15 LAPS events. That output is what tells you whether a legacy LAPS GPO, an old Intune profile, or a leftover CSP policy is already in play.
+Run once with `$Mode = 'Discover'` on a representative device before rollout. It prints the OS build and whether it clears the supported floor, whether the LAPS PowerShell module is present, whether the device is Entra joined, **every LAPS policy root that currently holds values** (with the winning one called out), which values this script owns, and the last 15 LAPS events. That output is what tells you whether a LAPS GPO, an old Intune profile, or a leftover CSP policy is already in play.
 
-The two values you must decide per tenant are `$BackupDirectory` (1 for Entra ID, 2 for hybrid-to-AD) and `$AdministratorAccountName` (leave `$null` unless a named account is already standardized). `$ADPasswordEncryptionPrincipal` is the only free-text identifier — take the group's SID or fully qualified name from AD, exactly as written, with no quotes or parentheses.
+There are no per-tenant identifiers to capture — nothing in the configuration is environment-specific. The one decision worth making up front is `$AdministratorAccountName`: leave it `$null` unless a named local admin account is already standardized across the fleet, in which case that account must already exist on every targeted device.
 
 ---
 
@@ -146,9 +142,7 @@ Deploy as a **Custom Script** Library Item using the audit-and-remediate pattern
 |---|---|
 | 10003 / 10004 / 10005 | Policy processing started / succeeded / failed (with error code) |
 | **10022** | The policy LAPS is actually using. **Confirm `Policy source: CSP` and `Backup directory: Azure AD` here** — this is the proof the script's policy took effect at the right precedence |
-| 10021 / 10023 | Same, for AD-backed and legacy-LAPS policy |
 | **10029** | Password successfully backed up to Microsoft Entra ID |
-| 10018 | Password successfully backed up to Active Directory |
 | 10020 | The local account was updated with the new password (logs the account name and RID) |
 | 10027 | No compatible password could be generated — `PasswordLength`/`PasswordComplexity` conflict with the device's local password policy |
 | 10031 | Something other than LAPS tried to change the managed account's password and was blocked |
@@ -184,7 +178,7 @@ Get-LapsAADPassword -DeviceIds <device-name> -IncludePasswords -AsPlainText
 | Set a setting to `$null` and re-enforce | That value removed, Windows default applies, exit 0 |
 | Passphrase config (`PasswordComplexity = 7`, `PassphraseLength = 5`) | Written, `PasswordLength` flagged as ignored, exit 0 |
 | Entra *registered* (not joined) device | Exit 2, nothing written |
-| `PasswordAgeDays = 3` with `BackupDirectory = 1` | Exit 2 naming the 7-day Entra minimum |
+| `PasswordAgeDays = 3` | Exit 2 naming the 7-day Entra minimum |
 | `AdministratorAccountName` pointing at a nonexistent account | Exit 2, nothing written |
 | Existing LAPS GPO present, then `Enforce` | Warning that the GPO root will be ignored; CSP root wins |
 | `Revert` | Only script-owned values removed, key removed if empty, state key gone, exit 0 |
@@ -198,11 +192,11 @@ Get-LapsAADPassword -DeviceIds <device-name> -IncludePasswords -AsPlainText
 
 **One password manager per account.** Once Windows LAPS manages an account it blocks every external password change and logs event 10031. Anything else that sets that account's password — a provisioning script, a helpdesk tool, another rotation mechanism — will start failing, and any copy of the password it holds goes stale. Point them at different accounts, or retire the other mechanism.
 
-**Policy roots do not merge.** Writing the CSP root switches Windows to it wholesale. A customer with a legacy LAPS GPO or a Microsoft LAPS `AdmPwd` configuration loses those settings the moment this runs — not to their old values, but to *Windows defaults*. `Discover` exists to surface this before you find out the hard way.
+**Policy roots do not merge.** Writing the CSP root switches Windows to it wholesale. A device carrying a LAPS GPO loses those settings the moment this runs — not to their old values, but to *Windows defaults*. `Discover` exists to surface this before you find out the hard way.
 
 **Sole-manager assumption.** The script assumes it alone manages these settings. A returning Intune LAPS profile writes the same root and will fight it.
 
-**Entra join only for `BackupDirectory = 1`.** Hybrid-joined devices can back up to AD (`= 2`) but then need the AD-side prerequisites — schema extension, OU permissions, and DFL 2016+ for encryption — which are out of scope here and not automated by this script.
+**Entra ID backup only.** `BackupDirectory` is fixed at `1` and the CSP's Active Directory settings are not implemented, matching Iru's cloud-only model. A fleet that needs passwords in on-premises AD needs a different tool — adding it back here would mean the AD-side prerequisites too (schema extension, OU permissions, domain functional level for encryption), none of which a Custom Script can arrange.
 
 **Rotation is the OS's job.** The script does not schedule, track, or report rotation beyond reading the event log at enforce time. Ongoing rotation reporting belongs in Entra.
 
@@ -222,7 +216,7 @@ Reverting stops future management at the next LAPS cycle. It does **not** delete
 |---|---|
 | 0 | Success / compliant |
 | 1 | Drift detected (Audit) or a runtime failure during Enforce/Revert |
-| 2 | Precondition failure: not elevated, OS build below Windows 11 24H2, invalid configuration for this join state, or a managed account that does not exist |
+| 2 | Precondition failure: not elevated, OS build below Windows 11 24H2, device not Entra joined, invalid configuration, or a managed account that does not exist |
 
 ---
 
@@ -231,9 +225,9 @@ Reverting stops future management at the next LAPS cycle. It does **not** delete
 **Vendor-documented (Microsoft Learn):**
 
 - [LAPS CSP](https://learn.microsoft.com/en-us/windows/client-management/mdm/laps-csp) — every node name under `./Device/Vendor/MSFT/LAPS`, its format (`int`/`bool`/`chr`), allowed values, ranges, defaults, dependencies, and the device-scope applicability table. Source for every range the script validates.
-- [Configure policy settings for Windows LAPS](https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-management-policy-settings) — the four policy registry roots and their names, the top-down precedence rule, the statement that settings are never shared or inherited across roots, the applicability-by-`BackupDirectory` table, per-setting semantics, and the default-value table. Also the source for which settings arrived in Windows 11 24H2 — all of which are therefore available across this script's supported range.
+- [Configure policy settings for Windows LAPS](https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-management-policy-settings) — the policy registry roots and their names, the top-down precedence rule, the statement that settings are never shared or inherited across roots, per-setting semantics, and the default-value table. Its applicability-by-`BackupDirectory` table is the source for which settings this script implements: the four marked *not applicable* under Entra ID backup are the four deliberately left out. Also the source for which settings arrived in Windows 11 24H2 — all of which are therefore available across this script's supported range.
 - [Get started with Windows LAPS and Microsoft Entra ID](https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-scenarios-azure-active-directory) — the tenant-level enablement requirement, the explicit statement that non-Intune Entra-joined devices deploy policy by direct registry modification, the settings that apply in Entra mode, `Invoke-LapsPolicyProcessing` / `Reset-LapsPassword` / `Get-LapsAADPassword` usage, the Graph permissions, and the Reset-LapsPassword throttling warning.
-- [Use Windows LAPS event logs](https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-management-event-log) — the `Microsoft-Windows-LAPS/Operational` channel, its Event Viewer path, and the meaning of events 10003/10004/10005, 10018, 10020, 10021/10022/10023, 10029, 10031, and 10041–10044, including the `Policy source:` line in the 10022 event.
+- [Use Windows LAPS event logs](https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-management-event-log) — the `Microsoft-Windows-LAPS/Operational` channel, its Event Viewer path, and the meaning of events 10003/10004/10005, 10020, 10022, 10027, 10029, 10031, and 10041–10044, including the `Policy source:` line in the 10022 event. (The doc also covers AD-backup and legacy-LAPS events, which this script does not surface.)
 - [LAPS PowerShell module](https://learn.microsoft.com/en-us/powershell/module/laps/) — the in-box cmdlet set the script relies on.
 - [Iru — Custom Scripts overview](https://docs.iru.com/en/endpoint/library/library-items-profiles/custom-scripts-overview#windows) — Windows audit/remediation semantics (non-zero audit exit = non-compliant, remediation runs only then), the 64-bit execution choice, the signing recommendation, and the once-per-device execution statement.
 
