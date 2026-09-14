@@ -36,8 +36,8 @@ The Library Item's uploaded `.zip` contains these files **at its root**:
 | File | Purpose |
 |---|---|
 | `MakeMeAdmin-2.4.1-x64-en-us.msi` | The Make Me Admin MSI, downloaded from the project's [GitHub Releases](https://github.com/pseymour/MakeMeAdmin/releases). |
-| `install.ps1` | Installs the MSI silently, writes your org policy to the registry, confirms install, and writes a detection marker. |
-| `uninstall.ps1` | Removes the MSI, clears the policy keys, and clears the detection marker. |
+| `Install-MakeMeAdmin.ps1` | From this folder. Installs the MSI silently, writes your org policy to the registry, confirms install, and writes a detection marker. |
+| `Uninstall-MakeMeAdmin.ps1` | From this folder. Removes the MSI, clears the policy keys, and clears the detection marker. |
 
 > **Packaging note**
 > The three files must sit at the **root** of the zip — not in a subfolder — so the scripts can find the `.msi` beside themselves. When zipping on macOS, build the archive from the files directly and exclude the `__MACOSX` metadata folder.
@@ -68,183 +68,29 @@ Get-FileHash .\MakeMeAdmin-2.4.1-x64-en-us.msi -Algorithm SHA256 | Select-Object
 
 ## 3. The wrapper scripts
 
-Both scripts are Windows PowerShell 5.1 compatible, log to `C:\ProgramData\Iru\Logs\`, and return MDM-friendly exit codes (`0` = success; MSI reboot codes `3010`/`1641` are treated as success).
+Both scripts live in this folder and are what you zip alongside the MSI:
 
-> **Edit the CONFIG block** at the top of `install.ps1` before packaging. That block is the single place you define who may elevate and your timeout/prompt policy.
+| File | Role |
+|---|---|
+| [`Install-MakeMeAdmin.ps1`](./Install-MakeMeAdmin.ps1) | Locates the single x64 MSI beside itself, installs it silently, confirms the product registered in Add/Remove Programs, writes the organization policy to the enforced registry key, then writes the detection marker — in that order, so the marker only exists once policy is in place. |
+| [`Uninstall-MakeMeAdmin.ps1`](./Uninstall-MakeMeAdmin.ps1) | Hands the same MSI to `msiexec /x`, treats 1605 (not installed) as already removed, then deletes both Make Me Admin registry keys and the marker. |
 
-### `install.ps1`
+Both are Windows PowerShell 5.1, run as SYSTEM, log to `C:\ProgramData\IruScripts\Logs\` (`Install-MakeMeAdmin.log`, `Install-MakeMeAdmin-msi.log` for the verbose MSI log, `Uninstall-MakeMeAdmin.log`) with every line mirrored to stdout so the Iru agent captures it, and use the repo's standard exit codes (§12).
 
-```powershell
-#Requires -Version 5.1
-<#
-    Make Me Admin — Iru Custom App install wrapper
-    Installs the bundled MSI (ALLUSERS=1) and applies org policy, then writes a
-    detection marker Iru reads for Pass/Installed status.
-#>
+> **Edit the CONFIGURATION block** at the top of `Install-MakeMeAdmin.ps1` before packaging. It is the single place you define who may elevate and the timeout/prompt policy; nothing below it needs editing.
 
-# ----------------------------- CONFIG -----------------------------
-# Four-part version string written to the detection marker. Must match the
-# Iru detection rule's String value. Update this for each new release.
-# PLACEHOLDER - read the real DisplayVersion off your MSI first (see §8).
-$AppVersion = '2.4.1.0'
+| Variable | Default | Writes registry value | Purpose |
+|---|---|---|---|
+| `$AppVersion` | `'2.4.1.0'` *(placeholder)* | *(detection marker)* | Four-part string written to `HKLM\SOFTWARE\Iru\Apps\MakeMeAdmin`; must equal the Library Item's Detection → String. Read the real value off a test install (§8). |
+| `$AllowedEntities` | `@('S-1-5-4')` | `Allowed Entities` | SIDs or `DOMAIN\Name` users/groups who may elevate. The default is the well-known INTERACTIVE SID — every signed-in user. Prefer SIDs; see the entity-naming note in §6. |
+| `$AdminRightsTimeout` | `15` | `Admin Rights Timeout` | Minutes of elevation per grant (Make Me Admin's own default is 10). |
+| `$PromptForReason` | `1` | `Prompt For Reason` | `0` none · `1` optional · `2` required. |
+| `$RequireAuthentication` | `1` | `Require Authentication For Privileges` | Re-enter Windows credentials before elevating. |
+| `$RenewalsAllowed` | `1` | `Renewals Allowed` | Times a user may extend a grant before it must lapse. |
+| `$RemoveAdminRightsOnLogout` | `1` | `Remove Admin Rights On Logout` | Drop rights immediately at sign-out. |
+| `$LogDirectory` / `$LogFile` / `$MsiLog` | `%ProgramData%\IruScripts\Logs\…` | — | Log locations. |
 
-# Who may elevate. Use SIDs for Entra-joined / sometimes-offline devices so the
-# entity resolves without a domain connection. Names must be DOMAIN\Name format
-# (UPNs do NOT work); for a LOCAL group use '.' or %COMPUTERNAME% as DOMAIN.
-# Example below allows all interactive users (well-known SID S-1-5-4).
-$AllowedEntities = @('S-1-5-4')
-
-# Default elevation window, in MINUTES.
-$AdminRightsTimeout = 15
-
-# Prompt for a reason: 0 = None, 1 = Optional, 2 = Required
-$PromptForReason = 1
-
-# Require the user to (re)enter Windows credentials before elevating: 0/1
-$RequireAuthentication = 1
-
-# How many times a user may renew their elevation before it must lapse.
-$RenewalsAllowed = 1
-
-# Remove admin rights immediately if the user logs off: 0/1
-$RemoveAdminRightsOnLogout = 1
-# ------------------------------------------------------------------
-
-$ErrorActionPreference = 'Stop'
-$PolicyKey   = 'HKLM:\SOFTWARE\Policies\Sinclair Community College\Make Me Admin'
-$MarkerKey   = 'HKLM:\SOFTWARE\Iru\Apps'
-$MarkerName  = 'MakeMeAdmin'
-$LogDir      = 'C:\ProgramData\Iru\Logs'
-$LogFile     = Join-Path $LogDir 'MakeMeAdmin-install.log'
-$MsiLog      = Join-Path $LogDir 'MakeMeAdmin-msi.log'
-
-function Write-Log {
-    param([string]$Message)
-    if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $Message"
-    Add-Content -Path $LogFile -Value $line
-    Write-Host $line          # mirrored to stdout so the Iru agent captures it
-}
-
-try {
-    Write-Log "=== Make Me Admin install started ==="
-    Write-Log "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-
-    # 1. Locate the bundled MSI beside this script.
-    $msi = Get-ChildItem -Path $PSScriptRoot -Filter '*x64*.msi' | Select-Object -First 1
-    if (-not $msi) { throw "No x64 MSI found beside install.ps1 in $PSScriptRoot" }
-    Write-Log "Found MSI: $($msi.Name)"
-
-    # 2. Install silently, per-machine. ALLUSERS=1 is set by the package itself.
-    #    Note: not $args - that is an automatic variable and must not be assigned.
-    $msiArgs = @('/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"")
-    Write-Log "Running: msiexec.exe $($msiArgs -join ' ')"
-    $p = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
-    Write-Log "msiexec exit code: $($p.ExitCode)"
-    if ($p.ExitCode -notin 0,3010,1641) { throw "MSI install failed with exit code $($p.ExitCode)" }
-
-    # 3. Confirm the product registered in the machine-wide uninstall hive.
-    $installed = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                                   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-                 Where-Object { $_.DisplayName -like '*Make Me Admin*' } |
-                 Select-Object -First 1
-    if (-not $installed) { throw "MSI reported success but no 'Make Me Admin' uninstall entry was found." }
-    Write-Log "Confirmed installed: $($installed.DisplayName) $($installed.DisplayVersion)"
-
-    # 4. Apply org policy to the enforced (Policies) key. These override the
-    #    plain settings key and are the right place for managed deployment.
-    if (-not (Test-Path $PolicyKey)) { New-Item -Path $PolicyKey -Force | Out-Null }
-    New-ItemProperty -Path $PolicyKey -Name 'Allowed Entities'                      -Value $AllowedEntities          -PropertyType MultiString -Force | Out-Null
-    New-ItemProperty -Path $PolicyKey -Name 'Admin Rights Timeout'                  -Value $AdminRightsTimeout       -PropertyType DWord       -Force | Out-Null
-    New-ItemProperty -Path $PolicyKey -Name 'Prompt For Reason'                     -Value $PromptForReason          -PropertyType DWord       -Force | Out-Null
-    New-ItemProperty -Path $PolicyKey -Name 'Require Authentication For Privileges' -Value $RequireAuthentication    -PropertyType DWord       -Force | Out-Null
-    New-ItemProperty -Path $PolicyKey -Name 'Renewals Allowed'                      -Value $RenewalsAllowed          -PropertyType DWord       -Force | Out-Null
-    New-ItemProperty -Path $PolicyKey -Name 'Remove Admin Rights On Logout'         -Value $RemoveAdminRightsOnLogout -PropertyType DWord      -Force | Out-Null
-    Write-Log "Policy written to $PolicyKey"
-
-    # 5. Write the detection marker AFTER everything else succeeds.
-    if (-not (Test-Path $MarkerKey)) { New-Item -Path $MarkerKey -Force | Out-Null }
-    New-ItemProperty -Path $MarkerKey -Name $MarkerName -Value $AppVersion -PropertyType String -Force | Out-Null
-    Write-Log "Marker written: $MarkerKey\$MarkerName = $AppVersion"
-
-    Write-Log "=== Completed. Exit code: 0 ==="
-    exit 0
-}
-catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    Write-Log "=== Failed. Exit code: 1 ==="
-    exit 1
-}
-```
-
-### `uninstall.ps1`
-
-```powershell
-#Requires -Version 5.1
-<#
-    Make Me Admin — Iru Custom App uninstall wrapper
-    Removes the MSI, clears the policy keys, and clears the detection marker.
-#>
-
-$ErrorActionPreference = 'Stop'
-$PolicyKey   = 'HKLM:\SOFTWARE\Policies\Sinclair Community College\Make Me Admin'
-$SettingsKey = 'HKLM:\SOFTWARE\Sinclair Community College\Make Me Admin'
-$MarkerKey   = 'HKLM:\SOFTWARE\Iru\Apps'
-$MarkerName  = 'MakeMeAdmin'
-$LogDir      = 'C:\ProgramData\Iru\Logs'
-$LogFile     = Join-Path $LogDir 'MakeMeAdmin-uninstall.log'
-
-function Write-Log {
-    param([string]$Message)
-    if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $Message"
-    Add-Content -Path $LogFile -Value $line
-    Write-Host $line          # mirrored to stdout so the Iru agent captures it
-}
-
-try {
-    Write-Log "=== Make Me Admin uninstall started ==="
-    Write-Log "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-
-    # Uninstall by handing the bundled MSI to msiexec /x, which reads the
-    # ProductCode out of that file - so no GUID is hardcoded here. This works
-    # because Iru stages the same package for install and uninstall, so the
-    # bundled MSI is the one that was installed. It does NOT uninstall some
-    # other version: if the installed build came from a different MSI whose
-    # ProductCode differs, msiexec returns 1605 (product not installed).
-    $msi = Get-ChildItem -Path $PSScriptRoot -Filter '*x64*.msi' | Select-Object -First 1
-    if ($msi) {
-        $msiArgs = @('/x', "`"$($msi.FullName)`"", '/qn', '/norestart')
-        Write-Log "Running: msiexec.exe $($msiArgs -join ' ')"
-        $p = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
-        Write-Log "msiexec exit code: $($p.ExitCode)"
-        # 1605 = "this action is only valid for products that are currently
-        # installed" - already gone, so the uninstall goal is met.
-        if ($p.ExitCode -eq 1605) {
-            Write-Log "Product was not installed (1605); treating as already removed."
-        }
-        elseif ($p.ExitCode -notin 0,3010,1641) {
-            throw "MSI uninstall failed with exit code $($p.ExitCode)"
-        }
-    } else {
-        Write-Log "No MSI found beside script; skipping product removal."
-    }
-
-    # Clear configuration and the detection marker.
-    Remove-Item -Path $PolicyKey   -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $SettingsKey -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $MarkerKey -Name $MarkerName -Force -ErrorAction SilentlyContinue
-    Write-Log "Cleared policy keys and detection marker."
-
-    Write-Log "=== Completed. Exit code: 0 ==="
-    exit 0
-}
-catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    Write-Log "=== Failed. Exit code: 1 ==="
-    exit 1
-}
-```
+Anything in the §6 settings table not listed here takes Make Me Admin's default. To manage an additional setting, add one more `New-ItemProperty` line in step 3 of the install script, using the value name and type from that table.
 
 ---
 
@@ -275,10 +121,10 @@ Create a **Custom App** Library Item with the following settings.
 
 | Field | Value |
 |---|---|
-| Install command | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -NoProfile -File install.ps1` |
-| Uninstall command | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -NoProfile -File uninstall.ps1` |
+| Install command | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -NoProfile -File Install-MakeMeAdmin.ps1` |
+| Uninstall command | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -NoProfile -File Uninstall-MakeMeAdmin.ps1` |
 
-> **Use the full path to the executable.** Iru treats the first token of the command as a file to launch from the package folder. A bare `powershell.exe` (or `msiexec.exe`) is not present there and fails with "the system cannot find the file specified." The fully-qualified path resolves correctly; `-File install.ps1` then loads from the package folder, which is the working directory at runtime. This is why the wrapper calls `msiexec.exe` with its full `System32` path internally, too.
+> **Use the full path to the executable.** Iru treats the first token of the command as a file to launch from the package folder. A bare `powershell.exe` (or `msiexec.exe`) is not present there and fails with "the system cannot find the file specified." The fully-qualified path resolves correctly; `-File Install-MakeMeAdmin.ps1` then loads from the package folder, which is the working directory at runtime. This is why the wrapper calls `msiexec.exe` with its full `System32` path internally, too.
 
 ### Detection logic rules
 
@@ -356,7 +202,7 @@ Run from elevated PowerShell after the agent enforces:
 
 ```powershell
 # 1. Wrapper log — should end with the marker line and "Exit code: 0"
-Get-Content C:\ProgramData\Iru\Logs\MakeMeAdmin-install.log -Tail 30
+Get-Content C:\ProgramData\IruScripts\Logs\Install-MakeMeAdmin.log -Tail 30
 
 # 2. The detection marker Iru reads
 Get-ItemProperty "HKLM:\SOFTWARE\Iru\Apps" -Name MakeMeAdmin | Select-Object MakeMeAdmin
@@ -419,12 +265,12 @@ None of these have been run yet — this is the test plan, not a result set.
    $r.GetType().InvokeMember('StringData','GetProperty',$null,$r,1)
    ```
    Note that `ProductVersion` may be three-part (`2.4.1`) while `DisplayVersion` reads four-part. Whatever the device actually reports is what the detection rule must match.
-3. **Update `$AppVersion`** at the top of `install.ps1` to that value.
-4. **Rebuild the zip** with the new `.msi` and the updated `install.ps1` (plus the unchanged `uninstall.ps1`). Remove the previous MSI — only one may be present.
+3. **Update `$AppVersion`** at the top of `Install-MakeMeAdmin.ps1` to that value.
+4. **Rebuild the zip** with the new `.msi` and the updated `Install-MakeMeAdmin.ps1` (plus the unchanged `Uninstall-MakeMeAdmin.ps1`). Remove the previous MSI — only one may be present.
 5. **Update the Library Item:** upload the new zip, set **Version** to the new display version, and set **Detection → String** to the value from step 2.
 6. **Save and enforce.** Because the device's marker no longer matches the detection rule, Iru re-runs the install command. The MSI performs an in-place upgrade (WiX downgrade-detection blocks installing an older build over a newer one), the wrapper updates the marker, and detection matches again.
 
-> **Uninstall follows the package, not the device.** Because `uninstall.ps1` derives the ProductCode from the bundled MSI, the Library Item can only uninstall the version it currently ships. After an upgrade, a device still on the old build (one that failed to upgrade, say) will not be removed by the new package's uninstall command — it returns 1605. Remove those manually, or keep the old package available until the fleet has converged.
+> **Uninstall follows the package, not the device.** Because `Uninstall-MakeMeAdmin.ps1` derives the ProductCode from the bundled MSI, the Library Item can only uninstall the version it currently ships. After an upgrade, a device still on the old build (one that failed to upgrade, say) will not be removed by the new package's uninstall command — it returns 1605. Remove those manually, or keep the old package available until the fleet has converged.
 
 > **If an update doesn't take:** increment the Library Item's **Version** field so the agent treats the payload as new and re-downloads it, rather than serving a cached copy.
 
@@ -434,13 +280,13 @@ None of these have been run yet — this is the test plan, not a result set.
 
 | Symptom | Where to look | Likely cause |
 |---|---|---|
-| Iru shows "failed," no wrapper log at `C:\ProgramData\Iru\Logs` | Iru agent log | The install command couldn't launch, so the script never ran. Most common cause: a bare `powershell.exe` instead of the full path. |
-| Wrapper log ends before "Confirmed installed" | `MakeMeAdmin-msi.log` | MSI error — the verbose MSI log names the cause (signing, downgrade block, locked service). |
+| Iru shows "failed," no wrapper log at `C:\ProgramData\IruScripts\Logs` | Iru agent log | The install command couldn't launch, so the script never ran. Most common cause: a bare `powershell.exe` instead of the full path. |
+| Wrapper log ends before "Confirmed installed" | `Install-MakeMeAdmin-msi.log` | MSI error — the verbose MSI log names the cause (signing, downgrade block, locked service). |
 | Installs but Iru shows "not installed" | Marker value vs. detection string | The detection string doesn't match the four-part `$AppVersion` the wrapper wrote. |
 | Installs, but users still can't elevate | UAC values | `EnableLUA=0` or `ConsentPromptBehaviorUser=0`. Re-enable UAC (see §5). |
 | "Grant" button greyed out for a user | `Allowed Entities` | The user/group isn't allowed, the name didn't resolve (offline + name instead of SID), or they're already an admin. |
 | Update not applying | Library Item Version field | Cached payload — bump the Version field to force a fresh download. |
-| Uninstall returns 1605 | `MakeMeAdmin-uninstall.log` | The installed build's ProductCode differs from the bundled MSI's — the package can only remove the version it ships (see §8). |
+| Uninstall returns 1605 | `Uninstall-MakeMeAdmin.log` | The installed build's ProductCode differs from the bundled MSI's — the package can only remove the version it ships (see §8). |
 | Wrong UI language after install | The MSI in the zip | Releases are per-language; the wrapper installs the first `*x64*.msi` it finds. Bundle exactly one. |
 
 ---
@@ -461,25 +307,26 @@ None of these have been run yet — this is the test plan, not a result set.
 
 ## 11. Rollback
 
-Trigger the Library Item's uninstall command (or run `uninstall.ps1` from the staged package folder). It removes the product, deletes both configuration keys — `HKLM\SOFTWARE\Policies\Sinclair Community College\Make Me Admin` and `HKLM\SOFTWARE\Sinclair Community College\Make Me Admin` — and clears the `HKLM\SOFTWARE\Iru\Apps\MakeMeAdmin` marker so Iru reads the device as not installed.
+Trigger the Library Item's uninstall command (or run `Uninstall-MakeMeAdmin.ps1` from the staged package folder). It removes the product, deletes both configuration keys — `HKLM\SOFTWARE\Policies\Sinclair Community College\Make Me Admin` and `HKLM\SOFTWARE\Sinclair Community College\Make Me Admin` — and clears the `HKLM\SOFTWARE\Iru\Apps\MakeMeAdmin` marker so Iru reads the device as not installed.
 
 Two things it deliberately does not do:
 
 - **It does not demote anyone.** A user who is elevated at the moment of uninstall keeps their Administrators membership — the service that would have removed them is gone. Check `Get-LocalGroupMember Administrators` on removal and clean up by hand if needed.
-- **It does not remove log files** under `C:\ProgramData\Iru\Logs\`. Delete them separately if the device is being reassigned.
+- **It does not remove log files** under `C:\ProgramData\IruScripts\Logs\`. Delete them separately if the device is being reassigned.
 
 To roll back to an earlier release, rebuild the package around the older MSI and bump the Library Item **Version** field — but note that WiX downgrade detection blocks installing an older build over a newer one, so the newer version must be uninstalled first.
 
 ## 12. Exit codes
 
-Both wrappers return:
+Both wrappers use the repo's standard scheme:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success — MSI installed/removed, policy written/cleared, marker updated |
-| 1 | Any failure — MSI non-success exit code, missing MSI, product not registered after install, or a registry write failure |
+| 0 | Success — product installed/removed, policy written/cleared, marker updated |
+| 1 | Runtime failure — MSI returned a non-success code, the product did not register after install, or a registry write failed |
+| 2 | Precondition failure — not elevated, or no x64 MSI found beside the script (nothing is changed in that case) |
 
-MSI reboot codes `3010` (reboot required) and `1641` (reboot initiated) are treated as success and reported as `0`; the wrapper never reboots the device itself. On uninstall, `1605` (product not installed) is also treated as success, since the goal state is already met. The underlying `msiexec` exit code is always recorded in the wrapper log before it is translated.
+MSI reboot codes `3010` (reboot required) and `1641` (reboot initiated) count as success; the wrappers never reboot the device. On uninstall, `1605` (product not installed) also counts as success because the goal state is already met. The raw `msiexec` exit code is always logged before it is translated. On an install failure the marker is deliberately not written, so the Library Item stays "not installed" and Iru retries on its next cycle.
 
 ---
 
