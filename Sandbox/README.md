@@ -13,6 +13,7 @@ Experimental helper scripts, provided as-is, without warranty or official Iru su
 | [`Manage-BrowserShortcuts/`](./Manage-BrowserShortcuts/) | Pushes browser and website shortcuts to the all-users (Public) desktop — creates, repairs, and removes them idempotently, with browser auto-detection. Single dual-slot script (`Manage-BrowserShortcuts.ps1`), Audit/Enforce/Discover/Revert. |
 | [`Manage-ChromeCBCMEnrollment/`](./Manage-ChromeCBCMEnrollment/) | Enrolls Chrome on Windows into Chrome Browser Cloud Management by writing the Chrome Enterprise Core enrollment token to the machine-level Chrome policy key, so Chrome policy is managed centrally from Google Admin until native ADMX support lands in Iru. |
 | [`Manage-DeviceName/`](./Manage-DeviceName/) | Renames devices to match a configurable token-based naming template (serial, asset tag, chassis, random digits), replicating the Intune Autopilot device name template and Rename device action. |
+| [`Manage-MakeMeAdmin/`](./Manage-MakeMeAdmin/) | Deploys Make Me Admin (temporary self-elevation for standard users) as an Iru Custom App: MSI install wrapper that also stamps org policy, uninstall wrapper, Library Item configuration, and a full settings reference. Untested. |
 | [`Manage-UsbStorageRestrictions/`](./Manage-UsbStorageRestrictions/) | Blocks USB mass storage while keeping non-storage USB peripherals functional, with a device-instance-ID allowlist. Replicates the Intune Device Installation restriction policies. |
 | [`Manage-WindowsHelloforBusiness/`](./Manage-WindowsHelloforBusiness/) | Manages Windows Hello for Business policy via GPO-equivalent registry keys, replicating the Intune WHfB settings catalog category. Audit and Enforce modes. |
 | [`Manage-WindowsLaps/`](./Manage-WindowsLaps/) | Enables Windows LAPS by writing the LAPS CSP policy root, so Entra-joined devices rotate and back up the local admin password to Microsoft Entra ID without Intune. Audit/Enforce/Discover/Revert, with LAPS event-log verification. |
@@ -24,5 +25,4 @@ No scripts here — these are Iru **Custom App** packaging guides:
 
 | Guide | Purpose |
 |---|---|
-| [`CustomApps/MakeMeAdmin/`](./CustomApps/MakeMeAdmin/Makemeadmincustomappreadme.md) | Installing, configuring, and maintaining Make Me Admin on managed Windows devices via an Iru Custom App Library Item. |
 | [`CustomApps/Notion/`](./CustomApps/Notion/Notioncustomappreadme.md) | Installing and maintaining the Notion desktop app on managed Windows devices via an Iru Custom App Library Item. |
