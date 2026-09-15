@@ -19,6 +19,15 @@ Experimental helper scripts, provided as-is, without warranty or official Iru su
 | [`Manage-WindowsLaps/`](./Manage-WindowsLaps/) | Enables Windows LAPS by writing the LAPS CSP policy root, so Entra-joined devices rotate and back up the local admin password to Microsoft Entra ID without Intune. Audit/Enforce/Discover/Revert, with LAPS event-log verification. |
 | [`SetLocalAdminPassword/`](./SetLocalAdminPassword/) | LAPS-style local admin password rotation: generates a random password, sets it on the local admin account, and stores it in the device's notes via the Iru API. |
 
+## Security validation labs — `SecurityValidation/`
+
+Harnesses that deliberately trigger Iru security features so detections can be verified. **Isolated test devices only — never scope to production.** See [`SecurityValidation/README.md`](./SecurityValidation/README.md).
+
+| Folder | Platform | Purpose |
+|---|---|---|
+| [`SecurityValidation/Test-IruEdrDetection/`](./SecurityValidation/Test-IruEdrDetection/) | Windows | `Test-IruEdrDetection.ps1` writes EICAR test artifacts into a Defender-excluded directory so Iru EDR's detection and quarantine can be observed instead of Defender winning the race. Audit/Enforce/Discover/Revert. |
+| [`SecurityValidation/Vuln-Brew-Core/`](./SecurityValidation/Vuln-Brew-Core/) | macOS | Installs pinned old Homebrew formulae with normal `homebrew/core` provenance so Iru vulnerability detection has known-CVE packages to report. |
+
 ## Documentation only — `CustomApps/`
 
 No scripts here — these are Iru **Custom App** packaging guides:

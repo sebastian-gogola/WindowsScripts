@@ -21,3 +21,5 @@ PowerShell scripts for Windows device management and automation on the [Iru](htt
 ## Sandbox
 
 Experimental helper scripts for common Windows management tasks (printers, USB restrictions, device naming, local admin management, and more). See the full index at [`Sandbox/README.md`](./Sandbox/README.md).
+
+[`Sandbox/SecurityValidation/`](./Sandbox/SecurityValidation/) holds lab harnesses that deliberately trigger Iru EDR and vulnerability detection on isolated test devices — not management scripts, and including the repository's one macOS (bash) script.
