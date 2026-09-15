@@ -57,7 +57,7 @@ The Library Item's uploaded `.zip` contains **three files at its root**:
 1. Locates the `.msix` packaged alongside it.
 2. Provisions it for all users with `Add-AppxProvisionedPackage`.
 3. Confirms the package registered, then writes a machine-wide registry marker (`HKLM\SOFTWARE\Iru\Apps\Notion = <version>`) that Iru uses for detection.
-4. Logs every step to `C:\ProgramData\IruLogs\Notion-install.log`.
+4. Logs every step to `C:\ProgramData\IruScripts\Logs\Notion-install.log`.
 
 The marker is written **only after** provisioning is confirmed, so a success status always reflects a genuinely installed app.
 
@@ -66,7 +66,7 @@ The marker is written **only after** provisioning is confirmed, so a success sta
 1. Removes the provisioned (all-users) copy so new logins do not re-receive it.
 2. Removes the package for any users who already have it registered.
 3. Clears the `HKLM\SOFTWARE\Iru\Apps\Notion` marker so Iru reads it as removed.
-4. Logs every step to `C:\ProgramData\IruLogs\Notion-uninstall.log`.
+4. Logs every step to `C:\ProgramData\IruScripts\Logs\Notion-uninstall.log`.
 
 Both scripts log the account they ran under. On a real Iru deployment this reads `NT AUTHORITY\SYSTEM`, confirming the agent invoked them in the expected context.
 
@@ -129,7 +129,7 @@ After the agent runs, confirm the result on the device with **elevated PowerShel
 
 ```powershell
 # 1. Script log — should end with "provisioned", the marker, and exit code 0
-Get-Content C:\ProgramData\IruLogs\Notion-install.log -Tail 30
+Get-Content C:\ProgramData\IruScripts\Logs\Notion-install.log -Tail 30
 
 # 2. The detection marker Iru reads
 Get-ItemProperty "HKLM:\SOFTWARE\Iru\Apps" -Name Notion | Select-Object Notion
@@ -185,7 +185,7 @@ Provisioned MSIX packages do not update themselves from this deployment method, 
 
 | Symptom | Where to look | Likely cause |
 |---|---|---|
-| Iru shows "failed," no script log at `C:\ProgramData\IruLogs` | Agent log under the Iru agent's logs folder | The install command could not launch, so the script never ran. Most common cause: a bare `powershell.exe` instead of the full path. |
+| Iru shows "failed," no script log at `C:\ProgramData\IruScripts\Logs` | Agent log under the Iru agent's logs folder | The install command could not launch, so the script never ran. Most common cause: a bare `powershell.exe` instead of the full path. |
 | Install log ends without "provisioned" | `Notion-install.log` | MSIX provisioning error — the logged exception names the cause (signing, sideload policy). |
 | Installs but Iru still shows "not installed" | Marker value vs. detection string | The detection string does not match the four-part version the script wrote. |
 | App opens to a blank window | Per-user app cache | Clear `%LocalAppData%\Notion` and `%AppData%\Notion`, then relaunch. |

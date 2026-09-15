@@ -7,6 +7,7 @@ Experimental helper scripts, provided as-is, without warranty or official Iru su
 | Folder | Purpose |
 |---|---|
 | [`Add-CUPS-IPP-Printer/`](./Add-CUPS-IPP-Printer/) | Adds a driverless (IPP Everywhere) printer pointing at an onsite CUPS print server, using the in-box Microsoft IPP Class Driver. Idempotent, audit-and-remediate pattern. |
+| [`Assign-IruDeviceUser/`](./Assign-IruDeviceUser/) | Assigns the signed-in user to the device in Iru via the Iru API, for fleets where assignment was never done, MDM migrations (which do not carry it over), and Autopilot enrollments (which do not perform it). Runs as SYSTEM, detects the console user, and completes the lookup in the user's session. |
 | [`Block-RemovableStorage/`](./Block-RemovableStorage/) | Blocks access to all removable storage classes at the access layer via the machine-level "Removable Storage Access" policies — FullBlock (deny everything) or ReadOnly (deny writes) postures, Audit/Enforce/Discover/Revert. The no-allowlist complement to `Manage-UsbStorageRestrictions`. |
 | [`CreateLocalAdmin/`](./CreateLocalAdmin/) | Creates a local administrator account on a Windows endpoint, idempotently, using the well-known Administrators SID for language-neutral compatibility. Designed for MDM deployment. |
 | [`Grant-OktaSCEPPrivateKeyAccess/`](./Grant-OktaSCEPPrivateKeyAccess/) | Companion to a full Okta Device Trust via Iru SCEP guide: grants the logged-in user read access to the SCEP certificate's private key when the certificate lands in the Local Machine store. |
