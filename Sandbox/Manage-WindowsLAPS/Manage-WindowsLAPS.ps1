@@ -54,7 +54,7 @@
     ($Mode = 'Audit') and Remediation slot ($Mode = 'Enforce').
 
 .NOTES
-    File     : Manage-WindowsLaps.ps1
+    File     : Manage-WindowsLAPS.ps1
     Version  : 1.0.0 (2026-09-08)
     Repo     : github.com/sebastian-gogola/WindowsScripts
     Target   : Windows 11 24H2 (build 26100) or later - the minimum Iru supports
@@ -182,7 +182,7 @@ $RotateNow = $false
 
 # Logging
 $LogDirectory = Join-Path $env:ProgramData 'IruScripts\Logs'
-$LogFile      = Join-Path $LogDirectory 'Manage-WindowsLaps.log'
+$LogFile      = Join-Path $LogDirectory 'Manage-WindowsLAPS.log'
 
 # =============================================================================
 # CONSTANTS
@@ -748,7 +748,7 @@ function Invoke-Revert {
 # MAIN
 # =============================================================================
 
-Write-Log "Manage-WindowsLaps v$ScriptVersion starting in mode: $Mode"
+Write-Log "Manage-WindowsLAPS v$ScriptVersion starting in mode: $Mode"
 
 if (-not (Test-IsElevated)) {
     Write-Log 'This script must run elevated (SYSTEM via Iru, or an elevated shell for testing).' 'ERROR'

@@ -1,8 +1,8 @@
-# Manage-WindowsLaps.ps1
+# Manage-WindowsLAPS.ps1
 
 Enables and manages **Windows LAPS** on Iru-managed Windows endpoints by configuring the LAPS CSP policy store, so Entra-joined devices back up their local administrator password to **Microsoft Entra ID** — no Intune, no LAPS licensing, no password custody in Iru.
 
-- **Script:** `Manage-WindowsLaps.ps1` (v1.0.0)
+- **Script:** `Manage-WindowsLAPS.ps1` (v1.0.0)
 - **Target OS:** Windows 11 24H2 (build 26100) or later — 24H2, 25H2, and anything newer
 - **Runs as:** SYSTEM (Iru Custom Script) or elevated admin shell
 - **PowerShell:** 5.1, no external modules
@@ -106,7 +106,7 @@ Registry value **names** and **semantics** are vendor-documented; the DWORD/SZ *
 | `$ApplyPolicyImmediately` | `$true` | Runs `Invoke-LapsPolicyProcessing` after writing, instead of waiting for the hourly cycle |
 | `$VerifyBackupSeconds` | `45` | How long to wait before reading the LAPS event log for the outcome; `0` skips |
 | `$RotateNow` | `$false` | Forces `Reset-LapsPassword` every run — leave `$false`, Microsoft throttles frequent calls |
-| `$LogDirectory` / `$LogFile` | `%ProgramData%\IruScripts\Logs\Manage-WindowsLaps.log` | Timestamped log, appended per run |
+| `$LogDirectory` / `$LogFile` | `%ProgramData%\IruScripts\Logs\Manage-WindowsLAPS.log` | Timestamped log, appended per run |
 
 **Three states per setting**, exactly like targeting/un-targeting in Intune:
 
