@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows Configuration Designer customization file for a standalone
+  "Iru-Enrollment" provisioning package.
+
+  TEMPLATE. Build-IruEnrollmentPackage.ps1 rewrites the three placeholders
+  (package ID, CommandFile source paths, tenant values in CommandLine) and
+  hands the result to ICD.exe. If you build by hand, replace them yourself.
+
+  Structure follows the WCD-generated customizations.xml that ships in the
+  OSD PowerShell module (Provisioning\customizations.xml), which runs a
+  PowerShell script through ProvisioningCommands/DeviceContext. The CommandFile
+  element text is the source path on the technician machine; the file keeps
+  its own name when Windows copies it to the device.
+
+  One CommandLine per package. Both files are copied to a per-package temp
+  folder on the device, which becomes the working directory, so the relative
+  .\ path in CommandLine is correct.
+-->
+<WindowsCustomizations>
+  <PackageConfig xmlns="urn:schemas-Microsoft-com:Windows-ICD-Package-Config.v1.0">
+    <ID>{__PACKAGE_ID__}</ID>
+    <Name>Iru-Enrollment</Name>
+    <Version>1.0</Version>
+    <OwnerType>ITAdmin</OwnerType>
+    <Rank>0</Rank>
+    <Notes>Enrolls the device into Iru Endpoint during provisioning by running Iru's mdmmigration.ps1 through Invoke-IruEnrollment.ps1. Runs as SYSTEM, silent, network required.</Notes>
+  </PackageConfig>
+  <Settings xmlns="urn:schemas-microsoft-com:windows-provisioning">
+    <Customizations>
+      <Common>
+        <ProvisioningCommands>
+          <DeviceContext>
+            <CommandFiles>
+              <CommandFile Name="Invoke-IruEnrollment">__BUILD_DIR__\files\Invoke-IruEnrollment.ps1</CommandFile>
+              <CommandFile Name="mdmmigration">__BUILD_DIR__\files\mdmmigration.ps1</CommandFile>
+            </CommandFiles>
+            <CommandLine>PowerShell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File .\Invoke-IruEnrollment.ps1 -Mode __MODE__ -RunSource PPKG -TenantName __TENANT_NAME__ -BlueprintId __BLUEPRINT_ID__ -EnrollmentCode __ENROLLMENT_CODE__ -TenantId __TENANT_ID__ -TenantLocation __TENANT_LOCATION__</CommandLine>
+          </DeviceContext>
+        </ProvisioningCommands>
+      </Common>
+    </Customizations>
+  </Settings>
+</WindowsCustomizations>
