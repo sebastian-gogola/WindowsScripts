@@ -5,6 +5,12 @@
 
 The script is designed to run from an elevated context (Administrator/SYSTEM). It can be executed interactively or fully unattended via the `-Silent` switch. Because it leverages native Windows APIs, it is safe to deploy to devices via your existing MDM solution or other remote execution tools.
 
+## Video walkthrough
+
+A step-by-step guide to configuring and running the script (4 min 28 s).
+
+https://github.com/user-attachments/assets/15821e47-7f05-4049-bc8a-056705027593
+
 ## Configuration Options
 You can supply required parameters via:
 
