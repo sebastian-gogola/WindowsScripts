@@ -19,6 +19,7 @@ Experimental helper scripts, provided as-is, without warranty or official Iru su
 | [`Manage-UsbStorageRestrictions/`](./Manage-UsbStorageRestrictions/) | Blocks USB mass storage while keeping non-storage USB peripherals functional, with a device-instance-ID allowlist. Replicates the Intune Device Installation restriction policies. |
 | [`Manage-WindowsHelloforBusiness/`](./Manage-WindowsHelloforBusiness/) | Manages Windows Hello for Business policy via GPO-equivalent registry keys, replicating the Intune WHfB settings catalog category. Audit and Enforce modes. |
 | [`Manage-WindowsLAPS/`](./Manage-WindowsLAPS/) | Enables Windows LAPS by writing the LAPS CSP policy root, so Entra-joined devices rotate and back up the local admin password to Microsoft Entra ID without Intune. Audit/Enforce/Discover/Revert, with LAPS event-log verification. |
+| [`Set-WebSignInAllowedUrls/`](./Set-WebSignInAllowedUrls/) | Sets the Policy CSP node `Authentication/ConfigureWebSignInAllowedUrls` (no ADMX equivalent) so the lock screen "I forgot my PIN" and Web sign-in flows reach a third-party IdP on Entra-joined devices after migration off Intune. MDM Bridge WMI when the build exposes the property, PolicyManager registry fallback otherwise; Audit/Enforce/Discover/Revert. Untested. |
 
 ## Security validation labs — `SecurityValidation/`
 
