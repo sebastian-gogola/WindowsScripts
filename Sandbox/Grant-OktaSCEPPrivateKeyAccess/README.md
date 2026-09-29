@@ -42,6 +42,9 @@ Before beginning the implementation, ensure the following are in place:
 > [!IMPORTANT]
 > The Secret Key is shown only once at the time of creation. If you lose it, you will need to regenerate a new key.
 
+> [!WARNING]
+> **Check the Secret Key for an underscore (`_`) before you save it.** On Windows, the Iru SCEP Challenge field accepts only letters, digits, space, and `' ( ) + , - . / : = ?` (the ASN.1 PrintableString set). Okta mints the Secret Key as base64url, whose alphabet includes `_`, so a key containing one fails on every Windows device with Event 32 / `0x80092021` before a request is ever sent to Okta. Hyphens and `=` padding are fine. If the key contains an underscore, regenerate the platform until you get one without it. See Troubleshooting.
+
 ![okta add platform 1](images/okta-add-platform-1.png)
 
 ![okta add platform 2](images/okta-add-platform-2.png)
@@ -87,7 +90,7 @@ Before beginning the implementation, ensure the following are in place:
 | --- | --- | --- |
 | URL | Your Okta SCEP URL | The base URL for the SCEP server, copied from Okta. |
 | Name (optional) | Okta | A friendly identifier for the SCEP server. Optional but recommended. |
-| Challenge | Your Okta Secret Key | The pre-shared secret used for automatic SCEP enrollment. |
+| Challenge | Your Okta Secret Key | The pre-shared secret used for automatic SCEP enrollment. Must contain only letters, digits, space, and `' ( ) + , - . / : = ?`; an underscore breaks Windows enrollment (see Step 1 and Troubleshooting). |
 | Fingerprint | SHA-256 value from Okta CA | The hex fingerprint of the Okta CA certificate. |
 | Subject | CN=$SERIAL_NUMBER | Uses the device serial number as the certificate Common Name, identifying the device within the CA. |
 | Key Size | 2048 | Standard RSA key length. |
@@ -210,6 +213,7 @@ Once devices are showing as “Managed” in the Okta device directory, you can 
 | **Symptom** | **Resolution** |
 | --- | --- |
 | Device shows as “Registered” but not “Managed” in Okta | Confirm the SCEP certificate was deployed successfully in the Iru device record. Check the Okta System Log for a “Bind client certificate to device” event. If missing, the certificate may not have reached Okta. |
+| SCEP profile fails on the device with Event 32 and `0x80092021` (CRYPT_E_INVALID_PRINTABLE_STRING, “The string contains a non-printable character”); Okta never receives a CSR | The Challenge contains a character Windows does not accept. Windows encodes the SCEP challenge as an ASN.1 PrintableString, which permits only letters, digits, space, and `' ( ) + , - . / : = ?`. Okta’s Secret Key is base64url and frequently contains `_`, which is outside that set, so the profile fails on-device before any request is sent. Regenerate the Okta Secret Key until it has no underscore, update the Challenge in the Library Item, and let devices check in. The fingerprint is not the cause: hex with or without spaces or colons is valid PrintableString, and the “non-printable character” wording does not mean hidden Unicode. Event 32 (“SCEP: Certificate enroll failed”) is logged under Applications and Services Logs > Microsoft > Windows > DeviceManagement-Enterprise-Diagnostics-Provider > Admin. Background: RFC 2985 defines challengePassword as a DirectoryString, so an encoder using UTF8String could carry an underscore; treat the restriction as a current platform limitation. |
 | Script reports “Could not confidently identify the Okta/SCEP certificate” | Add a tenant-specific identifier to $SearchHints, or target the certificate deterministically with -IssuerMatch or -Thumbprint. Avoid lowering $MinimumScore below 40 — that removes the requirement for a hint match, and the script may select an unrelated client-authentication certificate. |
 | Script aborts with “Ambiguous match” | Two distinct certificates scored identically. Re-run with -IssuerMatch (recommended) or -Thumbprint to disambiguate. |
 | Certificate is present but Okta Verify cannot use it | Run the remediation script with -WhatIf first to confirm it identifies the correct certificate and key. Then run without -WhatIf. Restart Okta Verify after the ACL change. |
@@ -221,3 +225,9 @@ Once devices are showing as “Managed” in the Okta device directory, you can 
 - Iru Blog – Okta Device Trust Integration: [https://www.iru.com/blog/archive/okta-device-trust-integration](https://www.iru.com/blog/archive/okta-device-trust-integration)
 - Okta Device Trust Documentation: [https://help.okta.com](https://help.okta.com) (search “Device Trust”)
 - Microsoft NCrypt API Reference: [https://learn.microsoft.com/en-us/windows/win32/api/ncrypt/](https://learn.microsoft.com/en-us/windows/win32/api/ncrypt/)
+- Iru SCEP Library Item – “SCEP challenge fails on Windows (invalid characters)” and the Windows-Specific Options character list: [https://docs.iru.com/en/endpoint/library/library-items-profiles/configure-the-scep-library-item#scep-challenge-fails-on-windows-invalid-characters](https://docs.iru.com/en/endpoint/library/library-items-profiles/configure-the-scep-library-item#scep-challenge-fails-on-windows-invalid-characters)
+- Microsoft COM Error Codes (Security and Setup) – `CRYPT_E_INVALID_PRINTABLE_STRING` 0x80092021, “The string contains a non-printable character”: [https://learn.microsoft.com/en-us/windows/win32/com/com-error-codes-4](https://learn.microsoft.com/en-us/windows/win32/com/com-error-codes-4)
+- RFC 2985 (PKCS #9), section 5.4.1 – `challengePassword` is a `DirectoryString`: [https://www.rfc-editor.org/rfc/rfc2985](https://www.rfc-editor.org/rfc/rfc2985)
+- ITU-T X.680 – PrintableString character set: [https://www.itu.int/ITU-T/studygroups/com17/languages/X.680-0207.pdf](https://www.itu.int/ITU-T/studygroups/com17/languages/X.680-0207.pdf)
+
+Sourcing note: the allowed-character list and the underscore failure are vendor-documented by Iru. The mapping to Event 32 / 0x80092021, the base64url origin of the underscore, and the fact that the fingerprint format is not involved are field-observed from a customer pilot in September 2026. The DirectoryString/UTF8String remark is an inference from RFC 2985, not a vendor statement.
